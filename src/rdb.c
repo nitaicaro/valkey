@@ -3986,3 +3986,67 @@ rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi) {
     }
     return NULL;
 }
+
+void rdbSetChecksumAlgorithmForSave(rio *rdb) {
+    serverAssert(rdb->cksum == 0);
+    serverAssert(rdb->update_cksum == NULL);
+
+    if (server.rdb_checksum) {
+        rdb->update_cksum = rioGenericUpdateChecksum;
+    }
+}
+
+sds rdbTempRdbFilename(const char *filename, pid_t pid) {
+    sds tmp_filename;
+    if (filename == NULL || !strcmp(filename, server.rdb_filename)) {
+        tmp_filename = sdscatprintf(sdsempty(), "temp-%d.rdb", (int)pid);
+    } else {
+        tmp_filename = sdscatprintf(sdsempty(), "%s-tmp", filename);
+    }
+    serverAssert(tmp_filename);
+    return tmp_filename;
+}
+
+void rdbRemoveTempFilesForRDB(const char *filename, pid_t pid, bool from_signal) {
+    sds tmp_filename = rdbTempRdbFilename(filename, pid);
+    int ret;
+    if (from_signal) {
+        int fd = open(tmp_filename, O_RDONLY|O_NONBLOCK);
+        UNUSED(fd);
+        ret = unlink(tmp_filename);
+    } else {
+        ret = bg_unlink(tmp_filename);
+    }
+
+    if (ret == 0) {
+        serverLog(LL_NOTICE, "Removed tempfile %s for RDB %s", tmp_filename, filename);
+        rdbRemoveMd5FileForRDB(filename);
+    } else if (filename != NULL) {
+        serverLog(LL_WARNING, "Error removing temp file %s for RDB %s: %s",
+                  tmp_filename, filename, strerror(errno));
+    }
+    sdsfree(tmp_filename);
+}
+
+bool rdbTryWriteMd5File(rio *rdb, const char *filename) {
+    /* MD5 not supported without OpenSSL */
+    UNUSED(rdb);
+    UNUSED(filename);
+    return 1;
+}
+
+static void rdbRemoveMd5File(const char *md5_filename) {
+    if (unlink(md5_filename) == 0) {
+        serverLog(LL_NOTICE, "Md5 checksum file %s has been removed.", md5_filename);
+    } else if (errno == ENOENT) {
+        serverLog(LL_NOTICE, "No MD5 file to remove for %s.", md5_filename);
+    } else {
+        serverLog(LL_WARNING, "Error removing md5 checksum file %s: %s", md5_filename, strerror(errno));
+    }
+}
+
+void rdbRemoveMd5FileForRDB(const char *filename) {
+    sds md5_filename = sdscatfmt(sdsempty(), "%s.md5", filename);
+    rdbRemoveMd5File(md5_filename);
+    sdsfree(md5_filename);
+}

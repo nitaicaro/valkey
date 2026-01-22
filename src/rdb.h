@@ -226,4 +226,11 @@ ssize_t rdbSaveFunctions(rio *rdb);
 rdbSaveInfo *rdbPopulateSaveInfo(rdbSaveInfo *rsi);
 void replicationEmptyDbCallback(hashtable *ht);
 
+/* Threadsave helper functions */
+void rdbSetChecksumAlgorithmForSave(rio *rdb);
+sds rdbTempRdbFilename(const char *filename, pid_t pid);
+void rdbRemoveTempFilesForRDB(const char *filename, pid_t pid, bool from_signal);
+bool rdbTryWriteMd5File(rio *rdb, const char *filename);
+void rdbRemoveMd5FileForRDB(const char *filename);
+
 #endif

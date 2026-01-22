@@ -145,6 +145,8 @@ struct hdr_histogram;
 #define C_ERR -1
 #define C_RETRY -2
 
+#define onRedisMainThread() ((pthread_self() == server.main_thread_id))
+
 /* Static server configuration */
 #define CONFIG_DEFAULT_HZ 10 /* Time interrupt calls/sec. */
 #define CONFIG_MIN_HZ 1
@@ -2067,6 +2069,17 @@ struct valkeyServer {
     int key_load_delay;                   /* Delay in microseconds between keys while
                                            * loading aof or rdb. (for testings). negative
                                            * value means fractions of microseconds (on average). */
+    /* Threadsave fields */
+    time_t cur_bgsave_time_start;         /* Current save start time */
+    int cur_bgsave_failure_reason;        /* Failure reason if save failed */
+    long long cur_save_time_usec;         /* Current save time in microseconds */
+    long long cur_save_serial_time_usec;  /* Serial time for current save */
+    long long last_save_time_usec;        /* Last save time in microseconds */
+    long long last_save_serial_time_usec; /* Serial time for last save */
+    long long last_bgsave_size_bytes;     /* Size of last bgsave in bytes */
+    long long save_iterator_epoch;        /* Iterator epoch for current save */
+    long long last_save_iterator_epoch;   /* Iterator epoch for last save */
+    long long iterator_epoch;             /* Global iterator epoch */
     /* Pipe and data structures for child -> parent info sharing. */
     int child_info_pipe[2]; /* Pipe used to write the child_info_data. */
     int child_info_nread;   /* Num of bytes of the last read from pipe */
@@ -2181,7 +2194,6 @@ struct valkeyServer {
                                           * when it receives an error on the replication stream */
     int repl_ignore_disk_write_error;    /* Configures whether replicas panic when unable to
                                           * persist writes to AOF. */
-
     /* The following two fields is where we store primary PSYNC replid/offset
      * while the PSYNC is in progress. At the end we'll copy the fields into
      * the server->primary client structure. */
