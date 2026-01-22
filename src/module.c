@@ -71,6 +71,7 @@
 #include "scripting_engine.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
+#include "threadsave.h"
 #include <dlfcn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -13746,7 +13747,7 @@ int VM_RdbLoad(ValkeyModuleCtx *ctx, ValkeyModuleRdbStream *stream, int flags) {
 
     /* Kill existing RDB fork as it is saving outdated data. Also killing it
      * will prevent COW memory issue. */
-    if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
+    if (isForkBgsaveInProgress()) killRDBChild();
 
     /* Kill existing slot migration fork as it is saving outdated data. Also killing it
      * will prevent COW memory issue. */

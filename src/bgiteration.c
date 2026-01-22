@@ -54,10 +54,6 @@ static bool isDeleteCmd(struct serverCommand *cmd) {
 }
 
 
-static bool onValkeyMainThread(void) {
-    return (pthread_equal(server.main_thread_id, pthread_self()) != 0);
-}
-
 /* Parse a parameters robj, extracting a valid DBID.
  * Returns FALSE if DBID isn't valid.
  */

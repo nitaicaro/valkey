@@ -1,4 +1,4 @@
-start_server {tags {"introspection"}} {
+start_server {tags {"introspection"} overrides {forkless-options-supported yes}} {
     test "PING" {
         assert_equal {PONG} [r ping]
         assert_equal {valkey} [r ping valkey]
@@ -871,38 +871,44 @@ start_server {tags {"introspection"}} {
         assert_error "ERR timeout is negative" {r client pause -1}
     }
 
-    test "CLIENT KILL close the client connection during bgsave" {
-        # Start a slow bgsave, trigger an active fork.
-        r flushall
-        r set k v
-        r config set rdb-key-save-delay 10000000
-        r bgsave
-        wait_for_condition 1000 10 {
-            [s rdb_bgsave_in_progress] eq 1
-        } else {
-            fail "bgsave did not start in time"
-        }
+    foreach bgsave_type {"" "fork" "thread"} {
+        test "CLIENT KILL close the client connection during bgsave - $bgsave_type" {
+            # Start a slow bgsave, trigger an active fork.
+            r flushall
+            r set k v
+            r config set rdb-key-save-delay 10000000
+            r bgsave {*}$bgsave_type
+            wait_for_condition 1000 10 {
+                [s rdb_bgsave_in_progress] eq 1
+            } else {
+                fail "bgsave did not start in time"
+            }
+            
+            # Verify we're testing the right save type
+            set expected_type [expr {$bgsave_type eq "thread" ? "thread" : "fork"}]
+            assert_equal [s rdb_current_bgsave_type] $expected_type
 
-        # Kill (close) the connection
-        r client kill skipme no
+            # Kill (close) the connection
+            r client kill skipme no
 
-        # In the past, client connections needed to wait for bgsave
-        # to end before actually closing, now they are closed immediately.
-        assert_error "*I/O error*" {r ping} ;# get the error very quickly
-        assert_equal "PONG" [r ping]
+            # In the past, client connections needed to wait for bgsave
+            # to end before actually closing, now they are closed immediately.
+            assert_error "*I/O error*" {r ping} ;# get the error very quickly
+            assert_equal "PONG" [r ping]
 
-        # Make sure the bgsave is still in progress
-        assert_equal [s rdb_bgsave_in_progress] 1
+            # Make sure the bgsave is still in progress
+            assert_equal [s rdb_bgsave_in_progress] 1
 
-        # Stop the child before we proceed to the next test
-        r config set rdb-key-save-delay 0
-        r flushall
-        wait_for_condition 1000 10 {
-            [s rdb_bgsave_in_progress] eq 0
-        } else {
-            fail "bgsave did not stop in time"
-        }
-    } {} {needs:save}
+            # Stop the child before we proceed to the next test
+            r config set rdb-key-save-delay 0
+            r flushall
+            wait_for_condition 1000 10 {
+                [s rdb_bgsave_in_progress] eq 0
+            } else {
+                fail "bgsave did not stop in time"
+            }
+        } {} {needs:save}
+    }
 
     test "CLIENT REPLY OFF/ON: disable all commands reply" {
         set rd [valkey_deferring_client]
