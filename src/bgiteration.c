@@ -59,12 +59,12 @@ static bool isDeleteCmd(struct serverCommand *cmd) {
     return ((cmd->proc == delCommand) || (cmd->proc == unlinkCommand));
 }
 
-
-static bool onValkeyMainThread(void) {
-    // Modules interact with the main thread using a mutex.  If a module owns the mutex, consider
-    //  that equivalent to being on the main thread.
-    bool inModule = (atomic_load_explicit(&server.module_gil_acquired, memory_order_relaxed) == 0);
-    return (inModule || pthread_equal(server.main_thread_id, pthread_self()) != 0);
+/* Returns true if the caller has main-thread-exclusive access to server state.
+ * This is satisfied either by actually running on the main thread, or by a module
+ * holding the GIL (which serializes access equivalently). */
+static bool hasMainThreadExclusivity(void) {
+    bool moduleHoldsGIL = (atomic_load_explicit(&server.module_gil_acquired, memory_order_relaxed) == 0);
+    return onValkeyMainThread() || moduleHoldsGIL;
 }
 
 /* Parse a parameters robj, extracting a valid DBID.
@@ -907,7 +907,7 @@ static void returnCurrentItemToValkey(bgIterator *it) {
 //=============================================================================================
 
 static void bgIteratorRelease(bgIterator *it) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     serverAssert(it->current_item == NULL);
     serverAssert(mutexQueueLength(it->items_for_iterator) == 0);
     serverAssert(mutexQueueLength(it->return_to_valkey) == 0);
@@ -1392,7 +1392,7 @@ static bool expediteKeysForWrite(
 // Called when an iterator is terminated.  Pulls everything out of the queue
 //  and returns the items to Valkey (before they hit the iterator).
 static void returnAllItemsToValkey(bgIterator *it) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     fifo *poppedFifo = mutexQueuePopAll(it->items_for_iterator, false);
     if (poppedFifo == NULL) return; // Nothing to return
@@ -1461,7 +1461,7 @@ static size_t replicationItemSize(bgIteratorItem *item) {
 }
 
 static void processReturnOfItemToValkey(bgIteratorItem *item, bgIterator *iter) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     switch ((int)item->type) {
         case BGITERATOR_ITEM_REPLICATION:
             bufferedReplicationBytes -= replicationItemSize(item);
@@ -1603,7 +1603,7 @@ static void receiveItemsBackFromIterators(bool blocking) {
     // Process each iterator's return_to_valkey queue
     // If `blocking` is true, continue reading until
     // at least one queue was not empty.
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     listIter li;
     listNode *node;
     bool processedItems = false;
@@ -1625,7 +1625,7 @@ static long long bgIteration_feedIterators_task(
     UNUSED(eventLoop);
     UNUSED(id);
     UNUSED(clientData);
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     static monotime lastFeedEndTime; // STATIC: Persists For checking starvation
     monotime startTime = getMonotonicUs();
@@ -1777,7 +1777,7 @@ static void resetReplicationFlagForIterators(client *c) {
 
 
 static void handleSwapdb(int db1, int db2) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     serverAssert(bgIteration_iterationActive());
     serverAssert(!server.cluster_enabled);
 
@@ -1852,7 +1852,7 @@ static void terminateIteratorForFlush(bgIterator *it, int dbid) {
 
 
 static void preserveIteratorItemsForFlush(bgIterator *it, int dbid) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     serverAssert(!(it->iteration_flags & BGITERATOR_FLAG_CONSISTENT));
     serverAssert(dbid >= 0);
     // Since this is not a consistent iteration, it's OK if the early_iterate_entries contains
@@ -2086,7 +2086,7 @@ static bgIterator * bgIteratorCreate(
         void *privdata,
         bgIterationType iter_type,
         genericIterator *keyset_iter) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     serverAssert(server.cluster_enabled || iter_type == BGITERATION_TYPE_FULLSCAN);
     serverAssert(server.cluster_enabled                 // Don't allow CONSISTENT & REPLICATION
             || !(flags & BGITERATOR_FLAG_CONSISTENT)    //  unless cluster mode (avoids
@@ -2182,7 +2182,7 @@ bgIterator * bgIteratorCreateSlotsIter(
 
 // PUBLIC API
 bgIterator * bgIteratorFind(const char *name) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     sds sdsname = sdsnew(name);
     bgIterator *it = dictFetchValue(nameToIterator, sdsname);
@@ -2224,7 +2224,7 @@ void bgIteratorGetStatus(bgIterator *it, bgIteratorStatus *status) {
 
 // PUBLIC API
 void bgIteratorTerminate(bgIterator *it) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     // Remove any items in the queue, but doesn't affect the 1 item that's being processed.
     returnAllItemsToValkey(it);
@@ -2305,7 +2305,7 @@ void bgIteratorClose(bgIterator *it) {
 
 // PUBLIC API
 void bgIteration_init(void) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     /* This should be called once and only once from the Valkey main thread.  However to support
      * unit tests, this is not validated, and multiple invocations are ignored.  */
@@ -2341,7 +2341,7 @@ bool bgIteration_iterationActive(void) {
 // PUBLIC API
 void bgIteration_keyDelete(int dbid, const_sds key) {
     if (!bgIteration_iterationActive()) return;
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     if (BGITERATION_DEBUG) {
         debugBuffer = sdscatprintf(debugBuffer, "KEYDEL: (%d)%s\n", dbid, key);
@@ -2387,7 +2387,7 @@ void bgIteration_flushall(void) {
 
 // PUBLIC API
 bool bgIteration_blockClientIfRequired(client *c) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     if (!bgIteration_iterationActive()) return false;
     if (!isWriteCmd(c->cmd)) return false;
 
@@ -2497,7 +2497,7 @@ void bgIteration_handleCommandReplication(
     }
 
     if (!bgIteration_iterationActive()) return;
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
 
     // Some commands are replicated which are not writes (like publish) these can be ignored.
     //  Be careful with MULTI which is not a write command, but must be replicated.
@@ -2710,7 +2710,7 @@ size_t bgIteration_memoryInuseForReplication(void) {
 
 // PUBLIC API
 bool bgIteration_isEntryInuse(dbEntry *de) {
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     return isEntryInuseByAnyIterator(de);
 }
 
@@ -2724,7 +2724,7 @@ uint32_t bgIteration_getEpoch(void) {
 // PUBLIC API
 void bgIteration_updateDbEntryPtr(dbEntry *old, dbEntry *new) {
     if (!bgIteration_iterationActive() || old == new) return;
-    serverAssert(onValkeyMainThread());
+    serverAssert(hasMainThreadExclusivity());
     serverAssert(!isEntryInuseByAnyIterator(old));
 
     listIter li;
