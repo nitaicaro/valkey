@@ -434,7 +434,7 @@ static int last_item_count_target;
 static long long bgIterator_timeproc_id;
 
 /* PUBLIC API - this is read whenever a dbEntry is modified in Valkey. */
-uint32_t bgIteration_epoch;
+uint32_t bgIteration_epoch = 0;  // TEMP: keep at 0 for testing
 
 
 // BgIteration debug captures BgIteration activity to a large sds buffer.  When an iterator is
@@ -2089,7 +2089,8 @@ static bgIterator * bgIteratorCreate(
     it->item_count_target = last_item_count_target;
     it->iteration_flags = flags;
     it->iteration_type = iter_type;
-    it->consistent_modification_id = bgIteration_epoch++;
+    // it->consistent_modification_id = bgIteration_epoch++;
+    it->consistent_modification_id = 0;  // TEMP: hardcode to 0 for testing
     it->keyset_iter = keyset_iter;
     it->early_iterate_entries = dictCreate(&dictEntryPtrDictType);
     dictExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);
