@@ -47,6 +47,7 @@
 #include "cluster.h"
 #include "cluster_migrateslots.h"
 #include "bgiteration.h"
+#include "threadsave.h"
 
 #include <math.h>
 #include <fcntl.h>
@@ -1696,6 +1697,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         serverLog(LL_NOTICE, "Background saving started by pid %ld", (long)childpid);
         server.rdb_save_time_start = time(NULL);
         server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+        server.cur_bgsave_type = RDB_BGSAVE_TYPE_FORK;
         return C_OK;
     }
     return C_OK; /* unreached */
@@ -3605,9 +3607,11 @@ static void backgroundSaveDoneHandlerDisk(int exitcode, int bysignal, time_t sav
         server.dirty = server.dirty - server.dirty_before_bgsave;
         server.lastsave = save_end;
         server.lastbgsave_status = C_OK;
+        server.lastbgsave_type = RDB_BGSAVE_TYPE_FORK;
     } else if (!bysignal && exitcode != 0) {
         serverLog(LL_WARNING, "Background saving error");
         server.lastbgsave_status = C_ERR;
+        server.lastbgsave_type = RDB_BGSAVE_TYPE_FORK;
     } else {
         mstime_t latency;
 
@@ -3662,6 +3666,7 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
     }
 
     server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
     server.rdb_save_time_last = save_end - server.rdb_save_time_start;
     server.rdb_save_time_start = -1;
     /* Possibly there are replicas waiting for a BGSAVE in order to be served
@@ -3866,7 +3871,7 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
 }
 
 void saveCommand(client *c) {
-    if (server.child_type == CHILD_TYPE_RDB) {
+    if (isSaveInProgress()) {
         addReplyError(c, "Background save already in progress");
         return;
     }
@@ -3882,30 +3887,51 @@ void saveCommand(client *c) {
     }
 }
 
-/* BGSAVE [SCHEDULE] */
+/* BGSAVE [SCHEDULE [FORK|THREAD]] | BGSAVE [FORK|THREAD] | BGSAVE CANCEL */
 void bgsaveCommand(client *c) {
     int schedule = 0;
+    int use_threadsave = 0;
 
-    /* The SCHEDULE option changes the behavior of BGSAVE when an AOF rewrite
-     * is in progress. Instead of returning an error a BGSAVE gets scheduled. */
-    if (c->argc > 1) {
-        if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "schedule")) {
+    /* BGSAVE can be invoked with the following options:
+     * - CANCEL: terminates an in-progress or scheduled BGSAVE (standalone only)
+     * - SCHEDULE: schedules a BGSAVE when an AOF rewrite is in progress.
+     *             Instead of returning an error, the BGSAVE is scheduled to run
+     *             when the AOF rewrite completes.
+     * - FORK: uses fork-based save (default)
+     * - THREAD: uses thread-based save
+     * SCHEDULE can be combined with FORK or THREAD to specify the save method. */
+    for (int i = 1; i < c->argc; i++) {
+        char *arg = objectGetVal(c->argv[i]);
+        if (!strcasecmp(arg, "schedule")) {
             schedule = 1;
-        } else if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "cancel")) {
+        } else if (!strcasecmp(arg, "cancel")) {
+            if (c->argc != 2) {
+                addReplyError(c, "Cancel cannot be combined with other options");
+                return;
+            }
             /* Terminates an in progress BGSAVE */
             if (server.child_type == CHILD_TYPE_RDB) {
-                /* There is an ongoing bgsave */
-                serverLog(LL_NOTICE, "Background saving will be aborted due to user request");
+                /* There is an ongoing fork-based bgsave */
+                serverLog(LL_NOTICE, "Background saving (fork) will be aborted due to user request");
                 killRDBChild();
                 addReplyStatus(c, "Background saving cancelled");
-            } else if (server.rdb_bgsave_scheduled == 1) {
+            } else if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) {
+                /* There is an ongoing threadsave */
+                serverLog(LL_NOTICE, "Background saving (thread) will be aborted due to user request");
+                threadsaveCancel();
+                addReplyStatus(c, "Background saving cancelled");
+            } else if (server.rdb_bgsave_scheduled != RDB_BGSAVE_TYPE_NONE) {
                 serverLog(LL_NOTICE, "Scheduled background saving will be cancelled due to user request");
-                server.rdb_bgsave_scheduled = 0;
+                server.rdb_bgsave_scheduled = RDB_BGSAVE_TYPE_NONE;
                 addReplyStatus(c, "Scheduled background saving cancelled");
             } else {
                 addReplyError(c, "Background saving is currently not in progress or scheduled");
             }
             return;
+        } else if (!strcasecmp(arg, "fork")) {
+            use_threadsave = 0;
+        } else if (!strcasecmp(arg, "thread")) {
+            use_threadsave = 1;
         } else {
             addReplyErrorObject(c, shared.syntaxerr);
             return;
@@ -3915,11 +3941,11 @@ void bgsaveCommand(client *c) {
     rdbSaveInfo rsi, *rsiptr;
     rsiptr = rdbPopulateSaveInfo(&rsi);
 
-    if (server.child_type == CHILD_TYPE_RDB) {
+    if (isSaveInProgress()) {
         addReplyError(c, "Background save already in progress");
     } else if (hasActiveChildProcess() || server.in_exec) {
         if (schedule || server.in_exec) {
-            server.rdb_bgsave_scheduled = 1;
+            server.rdb_bgsave_scheduled = use_threadsave ? RDB_BGSAVE_TYPE_THREAD : RDB_BGSAVE_TYPE_FORK;
             if (schedule) {
                 serverLog(LL_NOTICE, "Background saving scheduled due to user request");
             } else {
@@ -3931,8 +3957,10 @@ void bgsaveCommand(client *c) {
                              "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "
                              "possible.");
         }
+    } else if (use_threadsave && threadsaveToDisk(server.rdb_filename) == C_OK) {
+        addReplyStatus(c, "Background saving (thread) started");
     } else if (rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) == C_OK) {
-        addReplyStatus(c, "Background saving started");
+        addReplyStatus(c, "Background saving (fork) started");
     } else {
         addReplyErrorObject(c, shared.err);
     }

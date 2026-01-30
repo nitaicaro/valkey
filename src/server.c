@@ -51,6 +51,7 @@
 #include "module.h"
 #include "scripting_engine.h"
 #include "util.h"
+#include "threadsave.h"
 
 #include "eval.h"
 #include "bgiteration.h"
@@ -1678,12 +1679,18 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * Note: this code must be after the replicationCron() call above so
      * make sure when refactoring this file to keep this order. This is useful
      * because we want to give priority to RDB savings for replication. */
-    if (!hasActiveChildProcess() && server.rdb_bgsave_scheduled &&
+    if (!hasActiveChildProcess() && !isSaveInProgress() && server.rdb_bgsave_scheduled &&
         (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY || server.lastbgsave_status == C_OK)) {
-        rdbSaveInfo rsi, *rsiptr;
-        rsiptr = rdbPopulateSaveInfo(&rsi);
-        if (rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) == C_OK)
-            server.rdb_bgsave_scheduled = 0;
+        int result;
+        if (server.rdb_bgsave_scheduled == RDB_BGSAVE_TYPE_THREAD) {
+            result = threadsaveToDisk(server.rdb_filename);
+        } else {
+            rdbSaveInfo rsi, *rsiptr;
+            rsiptr = rdbPopulateSaveInfo(&rsi);
+            result = rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE);
+        }
+        if (result == C_OK)
+            server.rdb_bgsave_scheduled = RDB_BGSAVE_TYPE_NONE;
     }
 
     if (moduleCount()) {
@@ -2934,7 +2941,7 @@ void initServer(void) {
     server.rdb_pipe_numconns_writing = 0;
     server.rdb_pipe_buff = NULL;
     server.rdb_pipe_bufflen = 0;
-    server.rdb_bgsave_scheduled = 0;
+    server.rdb_bgsave_scheduled = RDB_BGSAVE_TYPE_NONE;
     server.child_info_pipe[0] = -1;
     server.child_info_pipe[1] = -1;
     server.child_info_nread = 0;

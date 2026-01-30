@@ -12,4 +12,6 @@
 /* If a BGSAVE fails, we attempt to categorize its failure cause. */
 typedef enum {SAVE_FAILURE_NONE=-1, SAVE_FAILURE_CANCELED, SAVE_FAILURE_DISK} saveFailureReason;
 
+int threadsaveToDisk(const char *filename);
+
 #endif
