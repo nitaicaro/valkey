@@ -300,13 +300,13 @@ static void emitStartThreadSaveMetrics(threadsaveInfo *saveInfo) {
 
     server.cur_bgsave_time_start = time(NULL);
 
-    updateDictResizePolicy();
-
     server.save_iterator_epoch = server.iterator_epoch;
     server.rdb_child_type = RDB_CHILD_TYPE_DISK;
     server.dirty_before_bgsave = server.dirty;
     server.rdb_save_time_start = time(NULL);
     server.lastbgsave_try = server.rdb_save_time_start;
+
+    updateDictResizePolicy();
 
     // moduleFireServerEvent(VALKEYMODULE_EVENT_AMAZON, VALKEYMODULE_SUBEVENT_AMAZON_THREADSAVE_START, NULL);
 }

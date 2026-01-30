@@ -2,6 +2,7 @@
 #define __THREADSAVE_H__
 
 #include "server.h"
+#include <stdbool.h>
 
 #define THREADSAVE_FILE_ITER_NAME "threadsave_file"
 
@@ -13,5 +14,6 @@
 typedef enum {SAVE_FAILURE_NONE=-1, SAVE_FAILURE_CANCELED, SAVE_FAILURE_DISK} saveFailureReason;
 
 int threadsaveToDisk(const char *filename);
+bool isThreadsaveActive(void);
 
 #endif

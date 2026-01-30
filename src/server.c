@@ -818,7 +818,7 @@ void updateDictResizePolicy(void) {
     if (server.in_fork_child != CHILD_TYPE_NONE || !server.dict_resizing) {
         dictSetResizeEnabled(DICT_RESIZE_FORBID);
         hashtableSetResizePolicy(HASHTABLE_RESIZE_FORBID);
-    } else if (hasActiveChildProcess()) {
+    } else if (hasActiveChildProcess() || isSaveInProgress()) {
         dictSetResizeEnabled(DICT_RESIZE_AVOID);
         hashtableSetResizePolicy(HASHTABLE_RESIZE_AVOID);
     } else {
@@ -842,6 +842,10 @@ const char *strChildType(int type) {
  * AOF rewriting, or some side process spawned by a loaded module. */
 int hasActiveChildProcess(void) {
     return server.child_pid != -1;
+}
+
+int isSaveInProgress(void) {
+    return server.rdb_child_type != RDB_CHILD_TYPE_NONE;
 }
 
 void resetChildState(void) {
@@ -6150,11 +6154,11 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "current_save_keys_processed:%zu\r\n", server.stat_current_save_keys_processed,
                 "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
                 "rdb_changes_since_last_save:%lld\r\n", server.dirty,
-                "rdb_bgsave_in_progress:%d\r\n", server.child_type == CHILD_TYPE_RDB,
+                "rdb_bgsave_in_progress:%d\r\n", isSaveInProgress(),
                 "rdb_last_save_time:%jd\r\n", (intmax_t)server.lastsave,
                 "rdb_last_bgsave_status:%s\r\n", (server.lastbgsave_status == C_OK) ? "ok" : "err",
                 "rdb_last_bgsave_time_sec:%jd\r\n", (intmax_t)server.rdb_save_time_last,
-                "rdb_current_bgsave_time_sec:%jd\r\n", (intmax_t)((server.child_type != CHILD_TYPE_RDB) ? -1 : time(NULL) - server.rdb_save_time_start),
+                "rdb_current_bgsave_time_sec:%jd\r\n", (intmax_t)(isSaveInProgress() ? time(NULL) - server.rdb_save_time_start : -1),
                 "rdb_saves:%lld\r\n", server.stat_rdb_saves,
                 "rdb_last_cow_size:%zu\r\n", server.stat_rdb_cow_bytes,
                 "rdb_last_load_keys_expired:%lld\r\n", server.rdb_last_load_keys_expired,
