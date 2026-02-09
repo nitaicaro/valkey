@@ -231,69 +231,94 @@ start_server_and_kill_it [list "dir" $server_path] {
     }
 }
 
-start_server {} {
-    test {Test FLUSHALL aborts bgsave} {
-        r config set save ""
-        # 5000 keys with 1ms sleep per key should take 5 second
-        r config set rdb-key-save-delay 1000
-        populate 5000
-        assert_lessthan 999 [s rdb_changes_since_last_save]
-        r bgsave
-        assert_equal [s rdb_bgsave_in_progress] 1
-        r flushall
-        # wait a second max (bgsave should take 5)
-        wait_for_condition 10 100 {
-            [s rdb_bgsave_in_progress] == 0
-        } else {
-            fail "bgsave not aborted"
+start_server {overrides {forkless-options-supported yes}} {
+    foreach bgsave_type {"" "fork" "thread"} {
+        test "Test FLUSHALL aborts bgsave $bgsave_type" {
+            r config set save ""
+            # 5000 keys with 1ms sleep per key should take 5 second
+            r config set rdb-key-save-delay 1000
+            populate 5000
+            assert_lessthan 999 [s rdb_changes_since_last_save]
+            r bgsave {*}$bgsave_type
+            assert_equal [s rdb_bgsave_in_progress] 1
+            
+            # Verify we're testing the right save type while it's running
+            set expected_type [expr {$bgsave_type eq "thread" ? "thread" : "fork"}]
+            assert_equal [s rdb_current_bgsave_type] $expected_type
+            
+            r flushall
+            # wait a second max (bgsave should take 5)
+            wait_for_condition 10 100 {
+                [s rdb_bgsave_in_progress] == 0
+            } else {
+                fail "bgsave not aborted"
+            }
+            # verify that bgsave failed, by checking that the change counter is still high
+            assert_lessthan 999 [s rdb_changes_since_last_save]
+            # make sure the server is still writable
+            r set x xx
         }
-        # verify that bgsave failed, by checking that the change counter is still high
-        assert_lessthan 999 [s rdb_changes_since_last_save]
-        # make sure the server is still writable
-        r set x xx
     }
 
-    test {bgsave resets the change counter} {
-        r config set rdb-key-save-delay 0
-        r bgsave
-        wait_for_condition 50 100 {
-            [s rdb_bgsave_in_progress] == 0
-        } else {
-            fail "bgsave not done"
+    foreach bgsave_type {"" "fork" "thread"} {
+        test "bgsave $bgsave_type resets the change counter" {
+            r config set rdb-key-save-delay 0
+            r bgsave {*}$bgsave_type
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 0
+            } else {
+                fail "bgsave not done"
+            }
+            assert_equal [s rdb_changes_since_last_save] 0
+            
+            # Verify we tested the right save type
+            set expected_type [expr {$bgsave_type eq "thread" ? "thread" : "fork"}]
+            assert_equal [s rdb_last_bgsave_type] $expected_type
         }
-        assert_equal [s rdb_changes_since_last_save] 0
     }
 
-    test {bgsave cancel aborts save} {
-        r config set save ""
-        # Generating RDB will take some 100 seconds
-        r config set rdb-key-save-delay 1000000
-        populate 100 "" 16
+    foreach bgsave_type {"" "fork" "thread"} {
+        test "bgsave cancel aborts $bgsave_type save" {
+            r config set save ""
+            # Generating RDB will take some 100 seconds
+            r config set rdb-key-save-delay 1000000
+            populate 100 "" 16
 
-        r bgsave
-        wait_for_condition 50 100 {
-            [s rdb_bgsave_in_progress] == 1
-        } else {
-            fail "bgsave did not start in time"
-        }
-        set fork_child_pid [get_child_pid 0]
-        
-        assert {[r bgsave cancel] eq {Background saving cancelled}}
-        set temp_rdb [file join [lindex [r config get dir] 1] temp-${fork_child_pid}.rdb]
-        # Temp rdb must be deleted
-        wait_for_condition 50 100 {
-            ![file exists $temp_rdb]
-        } else {
-            fail "bgsave temp file was not deleted after cancel"
-        }
+            r bgsave {*}$bgsave_type
+            wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 1
+            } else {
+                fail "bgsave did not start in time"
+            }
+            
+            # Verify we're testing the right save type
+            set expected_type [expr {$bgsave_type eq "thread" ? "thread" : "fork"}]
+            assert_equal [s rdb_current_bgsave_type] $expected_type
+            
+            if {$bgsave_type ne "thread"} {
+                set fork_child_pid [get_child_pid 0]
+            }
+            
+            assert {[r bgsave cancel] eq {Background saving cancelled}}
+            
+            if {$bgsave_type ne "thread"} {
+                set temp_rdb [file join [lindex [r config get dir] 1] temp-${fork_child_pid}.rdb]
+                # Temp rdb must be deleted
+                wait_for_condition 50 100 {
+                    ![file exists $temp_rdb]
+                } else {
+                    fail "bgsave temp file was not deleted after cancel"
+                }
+            }
 
-         # Make sure no save is running and that bgsave return an error
-         wait_for_condition 50 100 {
-            [s rdb_bgsave_in_progress] == 0
-        } else {
-            fail "bgsave is currently running"
+             # Make sure no save is running and that bgsave return an error
+             wait_for_condition 50 100 {
+                [s rdb_bgsave_in_progress] == 0
+            } else {
+                fail "bgsave is currently running"
+            }
+            assert_error "ERR Background saving is currently not in progress or scheduled" {r bgsave cancel}
         }
-        assert_error "ERR Background saving is currently not in progress or scheduled" {r bgsave cancel}
     }
 
     test {bgsave cancel schedulled request} {
@@ -519,52 +544,60 @@ start_server [list overrides [list "dir" $server_path "dbfilename" "scriptbackup
     }
 }
 
-start_server {} {
-    test "failed bgsave prevents writes" {
-        # Make sure the server saves an RDB on shutdown
-        r config set save "900 1"
+start_server {overrides {forkless-options-supported yes}} {
+    foreach bgsave_type {"" "fork" "thread"} {
+        test "failed bgsave $bgsave_type prevents writes" {
+            # Make sure the server saves an RDB on shutdown
+            r config set save "900 1"
 
-        r config set rdb-key-save-delay 10000000
-        populate 1000
-        r set x x
-        r bgsave
-        set pid1 [get_child_pid 0]
-        catch {exec kill -9 $pid1}
-        waitForBgsave r
+            r config set rdb-key-save-delay 10000000
+            populate 1000
+            r set x x
+            r bgsave {*}$bgsave_type
+            
+            if {$bgsave_type ne "thread"} {
+                set pid1 [get_child_pid 0]
+                catch {exec kill -9 $pid1}
+            } else {
+                # For threadsave, cancel it to simulate failure
+                r bgsave cancel
+            }
+            waitForBgsave r
 
-        # make sure a read command succeeds
-        assert_equal [r get x] x
+            # make sure a read command succeeds
+            assert_equal [r get x] x
 
-        # make sure a write command fails
-        assert_error {MISCONF *} {r set x y}
+            # make sure a write command fails
+            assert_error {MISCONF *} {r set x y}
 
-        # repeat with script
-        assert_error {MISCONF *} {r eval {
-            return redis.call('set','x',1)
-            } 1 x
-        }
-        assert_equal {x} [r eval {
-            return redis.call('get','x')
-            } 1 x
-        ]
+            # repeat with script
+            assert_error {MISCONF *} {r eval {
+                return redis.call('set','x',1)
+                } 1 x
+            }
+            assert_equal {x} [r eval {
+                return redis.call('get','x')
+                } 1 x
+            ]
 
-        # again with script using shebang
-        assert_error {MISCONF *} {r eval {#!lua
-            return redis.call('set','x',1)
-            } 1 x
-        }
-        assert_equal {x} [r eval {#!lua flags=no-writes
-            return redis.call('get','x')
-            } 1 x
-        ]
+            # again with script using shebang
+            assert_error {MISCONF *} {r eval {#!lua
+                return redis.call('set','x',1)
+                } 1 x
+            }
+            assert_equal {x} [r eval {#!lua flags=no-writes
+                return redis.call('get','x')
+                } 1 x
+            ]
 
-        r config set rdb-key-save-delay 0
-        r bgsave
-        waitForBgsave r
+            r config set rdb-key-save-delay 0
+            r bgsave {*}$bgsave_type
+            waitForBgsave r
 
-        # server is writable again
-        r set x y
-    } {OK}
+            # server is writable again
+            r set x y
+        } {OK}
+    }
 }
 
 start_server {} {
