@@ -2980,6 +2980,8 @@ void initServer(void) {
     server.cron_malloc_stats.allocator_active = 0;
     server.cron_malloc_stats.allocator_resident = 0;
     server.lastbgsave_status = C_OK;
+    server.lastbgsave_type = RDB_BGSAVE_TYPE_NONE;
+    server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
     server.aof_last_write_status = C_OK;
     server.aof_last_write_errno = 0;
     server.repl_good_replicas_count = 0;
@@ -6142,6 +6144,22 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
         }
         int aof_bio_fsync_status = atomic_load_explicit(&server.aof_bio_fsync_status, memory_order_relaxed);
 
+        /* Determine current bgsave type */
+        const char *current_bgsave_type;
+        switch (server.cur_bgsave_type) {
+            case RDB_BGSAVE_TYPE_FORK:   current_bgsave_type = "fork";   break;
+            case RDB_BGSAVE_TYPE_THREAD: current_bgsave_type = "thread"; break;
+            default:                     current_bgsave_type = "none";   break;
+        }
+
+        /* Determine last bgsave type */
+        const char *last_bgsave_type;
+        switch (server.lastbgsave_type) {
+            case RDB_BGSAVE_TYPE_FORK:   last_bgsave_type = "fork";   break;
+            case RDB_BGSAVE_TYPE_THREAD: last_bgsave_type = "thread"; break;
+            default:                     last_bgsave_type = "none";   break;
+        }
+
         info = sdscatprintf(
             info,
             "# Persistence\r\n" FMTARGS(
@@ -6155,6 +6173,8 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                 "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
                 "rdb_changes_since_last_save:%lld\r\n", server.dirty,
                 "rdb_bgsave_in_progress:%d\r\n", isSaveInProgress(),
+                "rdb_current_bgsave_type:%s\r\n", current_bgsave_type,
+                "rdb_last_bgsave_type:%s\r\n", last_bgsave_type,
                 "rdb_last_save_time:%jd\r\n", (intmax_t)server.lastsave,
                 "rdb_last_bgsave_status:%s\r\n", (server.lastbgsave_status == C_OK) ? "ok" : "err",
                 "rdb_last_bgsave_time_sec:%jd\r\n", (intmax_t)server.rdb_save_time_last,

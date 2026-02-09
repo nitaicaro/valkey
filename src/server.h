@@ -693,6 +693,11 @@ typedef enum {
 #define RDB_CHILD_TYPE_DISK 1   /* RDB is written to disk. */
 #define RDB_CHILD_TYPE_SOCKET 2 /* RDB is written to replica socket. */
 
+/* RDB bgsave type. */
+#define RDB_BGSAVE_TYPE_NONE 0
+#define RDB_BGSAVE_TYPE_FORK 1   /* Fork-based bgsave. */
+#define RDB_BGSAVE_TYPE_THREAD 2 /* Thread-based bgsave (threadsave). */
+
 /* Keyspace changes notification classes. Every class is associated with a
  * character for configuration purposes. */
 #define NOTIFY_KEYSPACE (1 << 0)  /* K */
@@ -2053,6 +2058,8 @@ struct valkeyServer {
     time_t rdb_save_time_start;           /* Current RDB save start time. */
     int rdb_bgsave_scheduled;             /* BGSAVE when possible if non-zero. Type: RDB_BGSAVE_TYPE_* */
     int rdb_child_type;                   /* Type of save by active child. */
+    int cur_bgsave_type;                  /* Current bgsave type: RDB_BGSAVE_TYPE_* */
+    int lastbgsave_type;                  /* RDB_BGSAVE_TYPE_* */
     int lastbgsave_status;                /* C_OK or C_ERR */
     int stop_writes_on_bgsave_err;        /* Don't allow writes if can't BGSAVE */
     int rdb_pipe_read;                    /* RDB pipe used to transfer the rdb data */

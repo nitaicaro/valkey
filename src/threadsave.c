@@ -302,6 +302,7 @@ static void emitStartThreadSaveMetrics(threadsaveInfo *saveInfo) {
 
     server.save_iterator_epoch = server.iterator_epoch;
     server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+    server.cur_bgsave_type = RDB_BGSAVE_TYPE_THREAD;
     server.dirty_before_bgsave = server.dirty;
     server.rdb_save_time_start = time(NULL);
     server.lastbgsave_try = server.rdb_save_time_start;
@@ -323,6 +324,7 @@ static void emitEndThreadSaveMetrics(threadsaveInfo *saveInfo, bool terminated) 
     time_t save_end = time(NULL);
     /* Record Redis disk metrics */
     server.lastbgsave_status = saveInfo->err_code;
+    server.lastbgsave_type = RDB_BGSAVE_TYPE_THREAD;
     server.rdb_save_time_last = save_end - server.rdb_save_time_start;
 
     if (saveInfo->err_code == C_OK) {
@@ -341,6 +343,7 @@ static void emitEndThreadSaveMetrics(threadsaveInfo *saveInfo, bool terminated) 
     server.last_bgsave_size_bytes = saveInfo->bytes_written;
 
     server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
     server.rdb_save_time_start = -1;
 
     server.save_iterator_epoch = 0;
