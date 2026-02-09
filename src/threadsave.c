@@ -585,3 +585,10 @@ werr:
     serverLog(LL_WARNING, "Error in threadsaveToDisk before starting thread");
     return C_ERR;
 }
+
+/* Cancels the currently running save.  Asserts if no save is in progress! */
+void threadsaveCancel(void) {
+    serverAssert(onRedisMainThread());
+    if (currentThreadsave == NULL) return;
+    bgIteratorTerminate(currentThreadsave->iterator);
+}
