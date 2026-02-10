@@ -343,11 +343,11 @@ start_server {overrides {forkless-options-supported yes}} {
 
         # Make sure a second call to bgsave cancel return an error
         assert_error "ERR Background saving is currently not in progress or scheduled" {r bgsave cancel}
+        
+        # Cleanup: speed up and wait for AOF rewrite to finish
+        r config set rdb-key-save-delay 0
+        waitForBgrewriteaof r
     }
-    
-    # Cleanup: speed up and wait for AOF rewrite to finish before next tests
-    r config set rdb-key-save-delay 0
-    waitForBgrewriteaof r
 
     test "thread bgsave contains expired keys from when save started" {
         r flushdb
@@ -387,6 +387,50 @@ start_server {overrides {forkless-options-supported yes}} {
         close $fd
         assert {[string first "k1" $rdb_content] != -1}
         assert {[string first "k2" $rdb_content] != -1}
+    } {} {needs:debug}
+
+    test "FLUSHDB during multi-db thread bgsave causes save to fail" {
+        # Disable automatic saves
+        r config set save ""
+        r select 0
+        r flushdb
+        
+        # Populate multiple databases
+        for {set i 0} {$i < 100} {incr i} {
+            r set key$i val$i
+        }
+        r select 1
+        for {set i 0} {$i < 100} {incr i} {
+            r set key$i val$i
+        }
+        r select 0
+        
+        # Start slow thread save
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Give threadsave time to start iterating
+        after 100
+        
+        # FLUSHDB on db 1 while save is running - this should terminate the save
+        r select 1
+        r flushdb
+        r select 0
+        
+        # Wait for save to abort
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "thread bgsave did not abort"
+        }
+        
+        # Threadsave should have failed
+        assert_equal [s rdb_last_bgsave_status] err
     } {} {needs:debug}
 
     foreach first_type {fork thread} {
