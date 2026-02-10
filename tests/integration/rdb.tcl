@@ -344,6 +344,33 @@ start_server {overrides {forkless-options-supported yes}} {
         # Make sure a second call to bgsave cancel return an error
         assert_error "ERR Background saving is currently not in progress or scheduled" {r bgsave cancel}
     }
+    
+    # Cleanup: speed up and wait for AOF rewrite to finish before next tests
+    r config set rdb-key-save-delay 0
+    waitForBgrewriteaof r
+
+    foreach first_type {fork thread} {
+        foreach second_type {fork thread} {
+            test "$first_type bgsave blocks $second_type bgsave" {
+                r config set save "" ;# Disable automatic saves
+                r config set rdb-key-save-delay 1000000
+                populate 100 "" 16
+
+                r bgsave $first_type
+                wait_for_condition 50 100 {
+                    [s rdb_bgsave_in_progress] == 1
+                } else {
+                    fail "$first_type bgsave did not start"
+                }
+                assert_equal [s rdb_current_bgsave_type] $first_type
+
+                assert_error "ERR Background save already in progress" {r bgsave $second_type}
+                
+                r bgsave cancel
+                waitForBgsave r
+            }
+        }
+    }
 
 
 }
