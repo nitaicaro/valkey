@@ -349,6 +349,46 @@ start_server {overrides {forkless-options-supported yes}} {
     r config set rdb-key-save-delay 0
     waitForBgrewriteaof r
 
+    test "thread bgsave contains expired keys from when save started" {
+        r flushdb
+        # Disable automatic saves
+        r config set save ""
+        
+        # Set two keys that expire together
+        r set k1 v1
+        r set k2 v2
+        set curr_time [clock seconds]
+        r expireat k1 [expr {$curr_time + 2}]
+        r expireat k2 [expr {$curr_time + 2}]
+        
+        # Start slow thread save
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Let both keys expire
+        after 3000
+        
+        # Serialize k1 in the foreground by touching it
+        r set k1 v11
+        
+        # Complete threadsave so k2 will be serialized in background
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Check both keys are in the RDB
+        set rdb_path [file join [lindex [r config get dir] 1] [lindex [r config get dbfilename] 1]]
+        set fd [open $rdb_path rb]
+        set rdb_content [read $fd]
+        close $fd
+        assert {[string first "k1" $rdb_content] != -1}
+        assert {[string first "k2" $rdb_content] != -1}
+    } {} {needs:debug}
+
     foreach first_type {fork thread} {
         foreach second_type {fork thread} {
             test "$first_type bgsave blocks $second_type bgsave" {
