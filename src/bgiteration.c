@@ -1885,9 +1885,9 @@ static void preserveIteratorItemsForFlush(bgIterator *it, int dbid) {
 static bool isDbSignificant(int dbid) {
     unsigned long long totalKeys = 0;
     for (int i = 0;  i < server.dbnum;  i++) {
-        totalKeys += dbSize(server.db[i]);
+        totalKeys += server.db[i] ? dbSize(server.db[i]) : 0;
     }
-    return dbSize(server.db[dbid]) > totalKeys / 2;
+    return server.db[dbid] ? dbSize(server.db[dbid]) > totalKeys / 2 : 0;
 }
 
 
