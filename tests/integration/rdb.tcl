@@ -433,6 +433,83 @@ start_server {overrides {forkless-options-supported yes}} {
         assert_equal [s rdb_last_bgsave_status] err
     } {} {needs:debug}
 
+    test "SWAPDB during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Populate 5 databases with all data types
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            createComplexDatasetForVerification r 20 "db${db}_"
+        }
+        r select 0
+        
+        # Get initial key count per database
+        array set initial_db_keys {}
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            set initial_db_keys($db) [r dbsize]
+        }
+        r select 0
+        
+        # Start slow threadsave
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Keep swapping databases until save completes
+        set perm [list 0 1 2 3 4]
+        set swaps 0
+        while {[s rdb_bgsave_in_progress] == 1 && $swaps < 200} {
+            incr swaps
+            # Shuffle permutation
+            for {set i 4} {$i > 0} {incr i -1} {
+                set j [expr {int(rand() * ($i + 1))}] ;# j is a random index from 0 to i, inclusive
+                set temp [lindex $perm $i]
+                lset perm $i [lindex $perm $j]
+                lset perm $j $temp
+            }
+            # Swap each database with its permuted target
+            for {set db 0} {$db < 5} {incr db} {
+                r swapdb $db [lindex $perm $db]
+            }
+            
+            # Speed up save after some swaps
+            if {$swaps == 50} {
+                r config set rdb-key-save-delay 0
+            }
+        }
+        
+        # Wait for save to complete if still running
+        if {[s rdb_bgsave_in_progress] == 1} {
+            r config set rdb-key-save-delay 0
+            waitForBgsave r
+        }
+        
+        # Verify save completed successfully
+        assert_equal [s rdb_last_bgsave_status] ok
+        
+        # Reload from RDB and verify keys are in ORIGINAL databases
+        # (SWAPDB is ignored for consistent snapshots)
+        r select 0
+        r debug reload
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            # Each database should have its original key count
+            assert_equal [r dbsize] $initial_db_keys($db)
+            # Verify original values in original database (sample check)
+            assert_equal [r get db${db}_before_0] "value_before_0"
+            assert_equal [r lrange db${db}_lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+            assert_equal [lsort [r smembers db${db}_set_0]] [list "B1" "B2"]
+            assert_equal [r hget db${db}_hash_0 "H1"] "a"
+        }
+        r select 0
+    } {} {needs:debug}
+
     foreach first_type {fork thread} {
         foreach second_type {fork thread} {
             test "$first_type bgsave blocks $second_type bgsave" {
