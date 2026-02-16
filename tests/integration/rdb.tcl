@@ -510,6 +510,77 @@ start_server {overrides {forkless-options-supported yes}} {
         r select 0
     } {} {needs:debug}
 
+    test "delete all keys after SWAPDB during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Populate 5 databases with all data types
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            createComplexDatasetForVerification r 20 "db${db}_"
+        }
+        r select 0
+        
+        # Get initial key count
+        set initial_keys 0
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            incr initial_keys [r dbsize]
+        }
+        r select 0
+        
+        # Start slow threadsave
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Swap databases with fixed permutation [2, 3, 4, 0, 1]
+        set perm [list 2 3 4 0 1]
+        for {set db 0} {$db < 5} {incr db} {
+            r swapdb $db [lindex $perm $db]
+        }
+        
+        # Delete all keys in all databases
+        for {set db 4} {$db >= 0} {incr db -1} {
+            r select $db
+            set keys [r keys *]
+            foreach key $keys {
+                r del $key
+            }
+            assert_equal [r dbsize] 0
+        }
+        
+        # Speed up and complete save
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Verify save completed successfully
+        assert_equal [s rdb_last_bgsave_status] ok
+        
+        # Reload from RDB and verify ORIGINAL keys still exist
+        # Consistent snapshot should preserve state before SWAPDB and deletions
+        r select 0
+        r debug reload
+        set total_keys 0
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            incr total_keys [r dbsize]
+        }
+        assert_equal $total_keys $initial_keys
+        
+        # Verify original values exist in original databases (sample check)
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            assert_equal [r get db${db}_before_0] "value_before_0"
+            assert_equal [r lrange db${db}_lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        }
+        r select 0
+    } {} {needs:debug}
+
     foreach first_type {fork thread} {
         foreach second_type {fork thread} {
             test "$first_type bgsave blocks $second_type bgsave" {
