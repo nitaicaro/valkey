@@ -542,6 +542,69 @@ start_server {overrides {forkless-options-supported yes}} {
         r select 0
     } {} {needs:debug}
 
+    test "modify new keys during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Populate database with all data types
+        createComplexDatasetForVerification r 20
+        set original_keys [r dbsize]
+        
+        # Start threadsave with very slow save (high delay per key)
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Create new keys with different data types while save is running
+        for {set i 0} {$i < 50} {incr i} {
+            r set after_str_$i "value_$i"
+            r lpush after_list_$i "L1" "L2"
+            r sadd after_set_$i "S1" "S2"
+            r zadd after_zset_$i 1 "Z1" 2 "Z2"
+            r hset after_hash_$i "H1" "V1"
+        }
+        
+        # Now MODIFY the new keys
+        for {set i 0} {$i < 50} {incr i} {
+            r append after_str_$i "_modified"
+            r lpush after_list_$i "L3"
+            r sadd after_set_$i "S3"
+            r zadd after_zset_$i 3 "Z3"
+            r hset after_hash_$i "H2" "V2"
+        }
+        
+        # Verify new keys were created and modified, save still in progress
+        set new_key_count [r dbsize]
+        assert {$new_key_count > $original_keys}
+        assert_equal [s rdb_bgsave_in_progress] 1
+        assert_match "*modified*" [r get after_str_0]
+        
+        # Speed up and complete save
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Verify save completed successfully
+        assert_equal [s rdb_last_bgsave_status] ok
+        
+        # Reload and verify ONLY original keys exist (new keys should NOT be in snapshot)
+        # Consistent snapshot should only have keys that existed at start
+        r debug reload
+        assert_equal [r dbsize] $original_keys
+        
+        # Verify original keys exist (sample check)
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        assert_equal [lsort [r smembers set_0]] [list "B1" "B2"]
+        
+        # Verify new keys do NOT exist in snapshot
+        assert_equal [r exists after_str_0] 0
+        assert_equal [r exists after_list_0] 0
+    } {} {needs:debug}
+
     test "SWAPDB during thread bgsave" {
         r flushall
         r config set save ""
