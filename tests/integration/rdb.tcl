@@ -471,6 +471,77 @@ start_server {overrides {forkless-options-supported yes}} {
         assert_equal [s rdb_last_bgsave_status] err
     } {} {needs:debug}
 
+    test "multiple databases modifications during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Populate 5 databases with all data types
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            createComplexDatasetForVerification r 20 "db${db}_"
+        }
+        r select 0
+        
+        # Start slow threadsave
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Modify keys in all databases while save is running
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            # Modify string keys
+            for {set i 0} {$i < 20} {incr i} {
+                r append db${db}_before_$i "_MODIFIED"
+            }
+            # Modify list keys
+            for {set i 0} {$i < 20} {incr i} {
+                r lpush db${db}_lst_$i "MODIFIED"
+            }
+            # Modify set keys
+            for {set i 0} {$i < 20} {incr i} {
+                r sadd db${db}_set_$i "MODIFIED"
+            }
+        }
+        r select 0
+        
+        # Verify modifications happened in live database
+        assert {[s rdb_changes_since_last_save] > 0}
+        r select 0
+        assert_match "*MODIFIED*" [r get db0_before_0]
+        
+        # Speed up and complete save
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Verify save completed successfully
+        assert_equal [s rdb_last_bgsave_status] ok
+        
+        # Reload from RDB and verify ORIGINAL values are preserved
+        # (consistent snapshot should capture state at start of save)
+        r debug reload
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            # Check that we have original values, not modified ones
+            set val [r get db${db}_before_0]
+            assert_match "value_before_0" $val
+            assert_no_match "*MODIFIED*" $val
+            
+            set list_items [r lrange db${db}_lst_0 0 -1]
+            assert {[lsearch $list_items "L1"] != -1}
+            assert {[lsearch $list_items "MODIFIED"] == -1}
+            
+            set set_members [r smembers db${db}_set_0]
+            assert {[lsearch $set_members "B1"] != -1}
+            assert {[lsearch $set_members "MODIFIED"] == -1}
+        }
+        r select 0
+    } {} {needs:debug}
+
     test "SWAPDB during thread bgsave" {
         r flushall
         r config set save ""
