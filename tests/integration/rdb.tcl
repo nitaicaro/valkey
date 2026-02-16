@@ -389,6 +389,44 @@ start_server {overrides {forkless-options-supported yes}} {
         assert {[string first "k2" $rdb_content] != -1}
     } {} {needs:debug}
 
+    test "FLUSHDB during single-db thread bgsave causes save to fail" {
+        r flushall
+        r config set save ""
+        
+        # Populate database with complex dataset
+        createComplexDataset r 100
+        
+        # Get initial key count
+        set initial_keys [r dbsize]
+        assert {$initial_keys > 0}
+        
+        # Start threadsave with very slow save (high delay per key)
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # FLUSHDB should cancel the save
+        r flushdb
+        assert_equal [r dbsize] 0
+        
+        # Speed up and wait for save to abort
+        # Note: Cancellation needs to be processed by background thread
+        r config set rdb-key-save-delay 0
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 0
+        } else {
+            fail "thread bgsave did not abort"
+        }
+        
+        # Verify save failed
+        assert_equal [s rdb_last_bgsave_status] err
+        assert_equal [s rdb_last_bgsave_type] thread
+    } {} {needs:debug}
+
     test "FLUSHDB during multi-db thread bgsave causes save to fail" {
         # Disable automatic saves
         r config set save ""
