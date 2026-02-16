@@ -581,6 +581,52 @@ start_server {overrides {forkless-options-supported yes}} {
         r select 0
     } {} {needs:debug}
 
+    test "deleting keys during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Populate database with all data types
+        createComplexDatasetForVerification r 20
+        set initial_keys [r dbsize]
+        assert {$initial_keys > 0}
+        
+        # Start threadsave with very slow save (high delay per key)
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "thread bgsave did not start"
+        }
+        
+        # Delete all keys in the database
+        set keys [r keys *]
+        foreach key $keys {
+            r del $key
+        }
+        
+        # Verify all keys deleted and save still in progress
+        assert_equal [r dbsize] 0
+        assert_equal [s rdb_bgsave_in_progress] 1
+        
+        # Speed up and complete save
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Verify save completed successfully
+        assert_equal [s rdb_last_bgsave_status] ok
+        
+        # Reload from RDB and verify ORIGINAL keys still exist
+        # Consistent snapshot should preserve keys that existed at start
+        r debug reload
+        assert_equal [r dbsize] $initial_keys
+        
+        # Verify original keys exist (sample check)
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        assert_equal [r smembers set_0] [lsort [list "B1" "B2"]]
+    } {} {needs:debug}
+
     foreach first_type {fork thread} {
         foreach second_type {fork thread} {
             test "$first_type bgsave blocks $second_type bgsave" {
