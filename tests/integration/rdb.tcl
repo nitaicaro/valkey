@@ -799,6 +799,415 @@ start_server {overrides {forkless-options-supported yes}} {
         assert_equal [r smembers set_0] [lsort [list "B1" "B2"]]
     } {} {needs:debug}
 
+    test "blocking commands during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Create initial dataset with 100 keys
+        createComplexDatasetForVerification r 100
+
+        # Start blocking commands on nonexistent keys BEFORE save starts
+        set rd1 [valkey_deferring_client]
+        set rd2 [valkey_deferring_client]
+        set rd3 [valkey_deferring_client]
+        set rd4 [valkey_deferring_client]
+        set rd5 [valkey_deferring_client]
+        set rd6 [valkey_deferring_client]
+        set rd7 [valkey_deferring_client]
+        
+        # Consume an item from a nonexistent key
+        $rd1 blpop new1 0
+        
+        # Set up a cascade of brpoplpush's on nonexistent keys
+        $rd2 brpoplpush new2 new3 0
+        $rd3 brpoplpush new3 new4 0
+        
+        # Nonexistent keys
+        $rd4 brpoplpush new5 new6 0
+        
+        # Cascade of brpoplpush's onto an existing key
+        $rd5 brpoplpush new88 new7 0
+        $rd6 brpoplpush new7 lst_2 0
+        
+        # Destination exists
+        $rd7 brpoplpush new8 lst_70 0
+        
+        # Start save with slow speed
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "bgsave didn't start"
+        }
+        
+        # Start more blocking commands during save
+        set rd8 [valkey_deferring_client]
+        set rd9 [valkey_deferring_client]
+        set rd10 [valkey_deferring_client]
+        set rd11 [valkey_deferring_client]
+        set rd12 [valkey_deferring_client]
+        
+        # Existing keys with new destinations, setting off some of the waiters
+        $rd8 brpoplpush lst_33 new1 0
+        $rd9 brpoplpush lst_27 new2 0
+        
+        # Duplicate another brpoplpush above
+        $rd10 brpoplpush new5 new6 0
+        
+        # New key but existing destination
+        $rd11 brpoplpush new9 lst_3 0
+        
+        # Consume an item from a nonexistent key
+        $rd12 brpop new100 0
+        
+        # Set off more waiters
+        r rpush new5 foobar
+        r rpush new88 foobar
+        
+        # Resume save at normal speed
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Wait for blocking commands to complete and read responses
+        # Only read from clients that should complete
+        after 100
+        $rd1 read  ;# Unblocked by rd8
+        $rd2 read  ;# Unblocked by rd9
+        $rd3 read  ;# Unblocked by rd2
+        $rd5 read  ;# Unblocked by rpush new88
+        $rd6 read  ;# Unblocked by rd5
+        $rd8 read  ;# Completes immediately (lst_33 exists)
+        $rd9 read  ;# Completes immediately (lst_27 exists)
+        
+        # Don't read from rd4, rd7, rd10, rd11, rd12 - they remain blocked or timeout
+        
+        # Verify the blocking commands executed correctly
+        assert_equal [r llen new1] 0
+        assert_equal [r llen new2] 0
+        assert_equal [r llen new3] 0
+        assert_equal [lindex [r lrange new4 -1 -1] 0] "R2"
+        assert_equal [r llen new5] 0
+        assert_equal [lindex [r lrange new6 -1 -1] 0] "foobar"
+        assert_equal [r llen new88] 0
+        assert_equal [r llen new7] 0
+        assert_equal [lindex [r lrange lst_2 0 0] 0] "foobar"
+        assert_equal [r llen new8] 0
+        assert_equal [r llen lst_70] 4
+        assert_equal [r llen lst_33] 3
+        assert_equal [r llen lst_27] 3
+        assert_equal [r llen lst_3] 4
+        
+        # Close deferred clients (those that didn't complete will be force-closed)
+        $rd1 close
+        $rd2 close
+        $rd3 close
+        $rd4 close
+        $rd5 close
+        $rd6 close
+        $rd7 close
+        $rd8 close
+        $rd9 close
+        $rd10 close
+        $rd11 close
+        $rd12 close
+
+        # Verify snapshot contains original keys (blocking commands should not affect snapshot)
+        r debug reload
+        
+        # Original keys should be preserved in snapshot
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r llen lst_2] 4
+        assert_equal [r llen lst_3] 4
+        assert_equal [r llen lst_27] 4
+        assert_equal [r llen lst_33] 4
+        assert_equal [r llen lst_70] 4
+        
+        # New keys created during save should NOT be in snapshot
+        assert_equal [r exists new1] 0
+        assert_equal [r exists new2] 0
+        assert_equal [r exists new3] 0
+        assert_equal [r exists new4] 0
+        assert_equal [r exists new5] 0
+        assert_equal [r exists new6] 0
+        assert_equal [r exists new7] 0
+        assert_equal [r exists new8] 0
+        assert_equal [r exists new88] 0
+        assert_equal [r exists new9] 0
+        assert_equal [r exists new100] 0
+    } {} {needs:debug}
+
+    test "evictions during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Create initial dataset
+        createComplexDatasetForVerification r 100
+        
+        # Start save with stopped speed
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "bgsave didn't start"
+        }
+        
+        # Trigger evictions by setting maxmemory below current usage
+        set current_memory [s used_memory]
+        set target_memory [expr {$current_memory * 3 / 4}]
+        r config set maxmemory $target_memory
+        r config set maxmemory-policy allkeys-lru
+        
+        # Generate evictions by adding new data
+        r set foo bar
+        
+        # Verify evictions occurred
+        set evicted_keys [s evicted_keys]
+        assert {$evicted_keys > 0}
+        assert_equal [s rdb_bgsave_in_progress] 1
+        
+        # Resume save at normal speed
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Reset maxmemory
+        r config set maxmemory 0
+        
+        # Verify snapshot contains original keys (evictions should not affect snapshot)
+        r debug reload
+        
+        # Original keys should be preserved in snapshot despite evictions
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r llen lst_0] 4
+        assert_equal [r smembers set_0] [lsort [list "B1" "B2"]]
+        
+        # New key created during save should NOT be in snapshot
+        assert_equal [r exists foo] 0
+    } {} {needs:debug}
+
+    test "comprehensive modifications on all data types during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Create initial dataset with 1000 keys
+        createComplexDatasetForVerification r 1000
+        
+        # Start save with stopped speed
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "bgsave didn't start"
+        }
+        
+        # Overwrite keys during save - comprehensive operations on all data types
+        for {set i 0} {$i < 1000} {incr i} {
+            r append before_$i "value_after_$i"
+            r incr int_$i
+            r set after_$i "VALUE_AFTER_$i"
+            r lpush lst_$i LL2 LL1
+            r rpush lst_$i RR1 RR2
+            r sadd set_$i BB1 BB2
+            r zadd zset_$i 5 Z2
+            r hset hash_$i H1 c
+            r pfadd hll_$i PF2
+        }
+        
+        # Verify changes were made
+        assert {[s rdb_changes_since_last_save] > 0}
+        assert_equal [s rdb_bgsave_in_progress] 1
+        
+        # Resume save at normal speed
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Verify snapshot contains original keys (modifications should not affect snapshot)
+        r debug reload
+        
+        # Original keys should be preserved in snapshot
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r get int_0] "42"
+        assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        assert_equal [lsort [r smembers set_0]] [list "B1" "B2"]
+        
+        # New keys created during save should NOT be in snapshot
+        assert_equal [r exists after_0] 0
+        assert_equal [r exists after_999] 0
+    } {} {needs:debug}
+
+    test "store key deletion by georadius during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Create initial dataset with geo data
+        createComplexDatasetForVerification r 1000
+        
+        # Create additional zsets for georadius STORE operations
+        r zadd georad_zset_delete_test 1 Z1 2 Z2
+        r zadd georadmem_zset_test 1 Z1 2 Z2 3 Z3
+        
+        # Start save with stopped speed
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "bgsave didn't start"
+        }
+        
+        # Use GEORADIUS with STORE - deletes georad_zset_delete_test key
+        r georadius geo_1 -122.191729 47.685821 5 mi STORE georad_zset_delete_test
+        
+        # Use GEORADIUSBYMEMBER with STORE - does not delete georadmem_zset_test as it returns 1 member
+        r georadiusbymember geo_1 seattle 5 mi STORE georadmem_zset_test
+        
+        # Verify changes were made
+        assert {[s rdb_changes_since_last_save] > 0}
+        assert_equal [s rdb_bgsave_in_progress] 1
+        
+        # Resume save at normal speed
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Verify snapshot contains original keys
+        r debug reload
+        
+        # Original geo_1 key should be preserved
+        assert_equal [r zcard geo_1] 1
+        
+        # Original zsets should be preserved (not deleted by STORE operations)
+        assert_equal [r zcard georad_zset_delete_test] 2
+        assert_equal [r zcard georadmem_zset_test] 3
+    } {} {needs:debug}
+
+    test "transactions during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Populate 5 databases
+        for {set db 0} {$db < 5} {incr db} {
+            r select $db
+            createComplexDatasetForVerification r 100
+        }
+        r select 0
+        
+        # Prepare transactions before save starts
+        set rd0 [valkey_deferring_client]
+        set rd1 [valkey_deferring_client]
+        
+        $rd0 select 0
+        $rd0 multi
+        $rd0 set int_1 bad
+        $rd0 incrby int_2 2
+        
+        $rd1 select 1
+        $rd1 multi
+        $rd1 set int_1 bad
+        $rd1 set int_2 bad1
+        $rd1 lpush lst_3 bad1
+        $rd1 sadd set_3 bad1
+        $rd1 set newkey bad1
+        
+        # Start save with slow speed
+        r config set rdb-key-save-delay 100000
+        r bgsave thread
+        
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "bgsave didn't start"
+        }
+        
+        # Start more transactions during save
+        set rd4 [valkey_deferring_client]
+        set rd3 [valkey_deferring_client]
+        
+        $rd4 select 4
+        $rd4 multi
+        $rd4 hset hash_49 bad1 a
+        $rd4 hset hash_10 H1 b
+        $rd4 zadd zset_3 2 bad1
+        $rd4 set newkey bad1
+        $rd4 set another_newkey bad55
+        $rd4 xadd newstream * D1 V2
+        
+        $rd3 select 3
+        $rd3 multi
+        $rd3 set aftersave bad1
+        $rd3 xadd another_newstream * D1 V3
+        
+        assert_equal [s rdb_bgsave_in_progress] 1
+        
+        # Execute first 3 transactions
+        $rd0 exec
+        $rd1 exec
+        $rd4 exec
+        
+        # Read responses
+        $rd0 read
+        $rd1 read
+        $rd4 read
+        
+        # Verify transactions executed
+        r select 0
+        assert_equal [r get int_1] "bad"
+        r select 1
+        assert_equal [r get int_2] "bad1"
+        r select 4
+        assert_equal [r get newkey] "bad1"
+        r select 3
+        assert_equal [r exists aftersave] 0
+        r select 4
+        assert_equal [r xlen newstream] 1
+        r select 3
+        assert_equal [r xlen another_newstream] 0
+        
+        assert_equal [s rdb_bgsave_in_progress] 1
+        
+        # Resume save at normal speed
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        
+        # Execute last transaction after save completes
+        r select 3
+        assert_equal [r exists aftersave] 0
+        $rd3 exec
+        $rd3 read
+        assert_equal [r get aftersave] "bad1"
+        assert_equal [r xlen another_newstream] 1
+        
+        # Close deferred clients
+        $rd0 close
+        $rd1 close
+        $rd3 close
+        $rd4 close
+        
+        # Verify snapshot contains original keys
+        r debug reload
+        
+        # Original keys should be preserved in all databases
+        r select 0
+        assert_equal [r get before_0] "value_before_0"
+        assert_equal [r get int_1] "42"
+        r select 1
+        assert_equal [r get int_2] "43"
+        assert_equal [r llen lst_3] 4
+        r select 4
+        assert_equal [r exists newkey] 0
+        assert_equal [r exists another_newkey] 0
+        assert_equal [r exists newstream] 0
+        r select 3
+        assert_equal [r exists aftersave] 0
+        assert_equal [r exists another_newstream] 0
+        r select 0
+    } {} {needs:debug}
+
     foreach first_type {fork thread} {
         foreach second_type {fork thread} {
             test "$first_type bgsave blocks $second_type bgsave" {
