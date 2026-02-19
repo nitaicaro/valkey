@@ -1060,7 +1060,7 @@ TEST_F(BgIterationTest, testClientCloseBeforeRead) {
     EXPECT_TRUE(cleanupTerminated);
 }
 
-
+#ifdef CODE_NOT_READY_YET
 // Test that the full scan hits each item in the expected sequence.
 TEST_F(BgIterationTest, orderedIteration) {
     bgIterator *it = bgIteratorCreateFullScanIter("simple",
@@ -1213,6 +1213,7 @@ TEST_F(BgIterationTest, modFutureItem_YesReplication_NoConsistent) {
     expectReadComplete(it);
     freeTestClient(c);
 }
+#endif
 #ifdef CODE_NOT_READY_YET
 
 

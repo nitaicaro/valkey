@@ -70,6 +70,7 @@
 #include "connection.h"
 #include "bio.h"
 #include "mutexqueue.h"
+#include "tls.h"
 #include <stdatomic.h>
 
 static unsigned int bio_job_to_worker[] = {
@@ -78,6 +79,7 @@ static unsigned int bio_job_to_worker[] = {
     [BIO_CLOSE_AOF] = 1,
     [BIO_LAZY_FREE] = 2,
     [BIO_RDB_SAVE] = 3,
+    [BIO_TLS_RELOAD] = 4, /* only used when BUILD_TLS=yes */
 };
 
 typedef struct {
@@ -91,6 +93,7 @@ static bio_worker_data bio_workers[] = {
     {"bio_aof"},
     {"bio_lazy_free"},
     {"bio_rdb_save"},
+    {"bio_tls_reload"}, /* only used when BUILD_TLS=yes */
 };
 static const bio_worker_data *const bio_worker_end = bio_workers + (sizeof bio_workers / sizeof *bio_workers);
 
@@ -133,6 +136,10 @@ typedef union bio_job {
         connection *conn;    /* Connection to download the RDB from */
         int is_dual_channel; /* Single vs dual channel */
     } save_to_disk_args;
+
+    struct {
+        int type;
+    } tls_reload_args;
 } bio_job;
 
 void *bioProcessBackgroundJobs(void *arg);
@@ -227,6 +234,11 @@ void bioCreateSaveRDBToDiskJob(connection *conn, int is_dual_channel) {
     bioSubmitJob(BIO_RDB_SAVE, job);
 }
 
+void bioCreateTlsReloadJob(void) {
+    bio_job *job = zmalloc(sizeof(*job));
+    bioSubmitJob(BIO_TLS_RELOAD, job);
+}
+
 void *bioProcessBackgroundJobs(void *arg) {
     bio_worker_data *const bwd = arg;
     sigset_t sigset;
@@ -248,8 +260,9 @@ void *bioProcessBackgroundJobs(void *arg) {
     bio_worker_num = bioWorkerNum(bwd);
 
     while (1) {
-        /* Get job - blocking until available */
-        bio_job *job = mutexQueuePop(bwd->bio_jobs, true);
+        /* Keep the job in the queue until it's fully processed so cancellation
+         * won't leave an untracked in-flight allocation. */
+        bio_job *job = mutexQueuePeek(bwd->bio_jobs, true);
 
         /* Process the job accordingly to its type. */
         int job_type = job->header.type;
@@ -291,9 +304,17 @@ void *bioProcessBackgroundJobs(void *arg) {
             job->free_args.free_fn(job->free_args.free_args);
         } else if (job_type == BIO_RDB_SAVE) {
             replicaReceiveRDBFromPrimaryToDisk(job->save_to_disk_args.conn, job->save_to_disk_args.is_dual_channel);
+        } else if (job_type == BIO_TLS_RELOAD) {
+#if defined(USE_OPENSSL) && USE_OPENSSL == 1 /* BUILD_YES */
+            tlsConfigureAsync();
+#else
+            serverPanic("BIO_TLS_RELOAD job type requires built-in TLS (BUILD_TLS=yes).");
+#endif
         } else {
             serverPanic("Wrong job type in bioProcessBackgroundJobs().");
         }
+        void *removed_job = mutexQueuePop(bwd->bio_jobs, false);
+        serverAssert(removed_job == job);
         zfree(job);
         atomic_fetch_sub(&bio_jobs_counter[job_type], 1);
     }
