@@ -938,6 +938,61 @@ start_server {overrides {forkless-options-supported yes}} {
         assert_equal [r exists new100] 0
     } {} {needs:debug}
 
+    test "TTL expiration during thread bgsave" {
+        r flushall
+        r config set save ""
+        
+        # Create initial dataset with 20 keys
+        set num_keys 20
+        createComplexDatasetForVerification r $num_keys
+        
+        # Set TTLs on all keys - key i expires in (i/10 + 1) seconds
+        set start_time [clock milliseconds]
+        for {set i 0} {$i < $num_keys} {incr i} {
+            set ttl [expr {$i/10 + 1}]
+            foreach prefix {before int lst set zset hash hll bits geo stream iset} {
+                r expire ${prefix}_${i} $ttl
+            }
+        }
+        
+        # Start save and wait for completion
+        r bgsave thread
+        waitForBgsave r
+        
+        # Reload from RDB
+        r debug reload
+        
+        # Check keycount is reasonable
+        set keycount [r dbsize]
+        assert {$keycount <= $num_keys * 11}
+        
+        # Verify keys based on elapsed time (direct translation of original loop)
+        set verified [list]
+        for {set i 0} {$i < $num_keys} {incr i} {
+            lappend verified $i
+        }
+        
+        while {[llength $verified] > 0} {
+            set elapsed_time [expr {([clock milliseconds] - $start_time) / 1000.0}]
+            
+            foreach i $verified {
+                # If not yet expired, verify key exists
+                if {$elapsed_time < [expr {$i/10.0}]} {
+                    assert_equal [r exists before_${i}] 1
+                }
+                
+                # If expired for more than 2 seconds, verify key is gone and remove from list
+                if {$elapsed_time > [expr {$i/10.0 + 2}]} {
+                    assert_equal [r exists before_${i}] 0
+                    assert_equal [r exists lst_${i}] 0
+                    set verified [lsearch -all -inline -not -exact $verified $i]
+                }
+            }
+            
+            after 100
+        }
+    } {} {needs:debug}
+
     test "evictions during thread bgsave" {
         r flushall
         r config set save ""
