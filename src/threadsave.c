@@ -85,12 +85,12 @@ static int writeRdbStartMarker(threadsaveInfo *saveInfo) {
 
     rdbSetChecksumAlgorithmForSave(&saveInfo->save_rio);
 
-    char magic[REDIS_RDB_MAGIC_SIZE + 1];
+    char magic[VALKEY_RDB_MAGIC_SIZE + 1];
     int charsWritten;
 
     charsWritten = snprintf(magic, sizeof(magic), "VALKEY%03d", RDB_VERSION);
-    serverAssert(charsWritten == REDIS_RDB_MAGIC_SIZE);
-    if (rioWrite(&saveInfo->save_rio, magic, REDIS_RDB_MAGIC_SIZE) == 0) {
+    serverAssert(charsWritten == VALKEY_RDB_MAGIC_SIZE);
+    if (rioWrite(&saveInfo->save_rio, magic, VALKEY_RDB_MAGIC_SIZE) == 0) {
         serverLog(LL_WARNING, "threadsave: error while writing valkey magic string");
         return C_ERR;
     }

@@ -5,7 +5,7 @@
 
 #define THREADSAVE_FILE_ITER_NAME "threadsave_file"
 
-#define REDIS_RDB_MAGIC_SIZE 9
+#define VALKEY_RDB_MAGIC_SIZE 9
 
 #define VALKEY_THREADSAVE_RDB_VERSION 4
 
