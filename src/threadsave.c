@@ -301,7 +301,7 @@ static void emitStartThreadSaveMetrics(threadsaveInfo *saveInfo) {
     server.cur_bgsave_time_start = time(NULL);
 
     server.save_iterator_epoch = server.iterator_epoch;
-    server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+    server.rdb_write_target = RDB_WRITE_TARGET_DISK;
     server.cur_bgsave_type = RDB_BGSAVE_TYPE_THREAD;
     server.dirty_before_bgsave = server.dirty;
     server.rdb_save_time_start = time(NULL);
@@ -342,7 +342,7 @@ static void emitEndThreadSaveMetrics(threadsaveInfo *saveInfo, bool terminated) 
     }
     server.last_bgsave_size_bytes = saveInfo->bytes_written;
 
-    server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    server.rdb_write_target = RDB_WRITE_TARGET_NONE;
     server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
     server.rdb_save_time_start = -1;
 

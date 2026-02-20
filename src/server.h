@@ -690,10 +690,10 @@ typedef enum {
     CLUSTER_ENDPOINT_TYPE_UNKNOWN_ENDPOINT /* Show NULL or empty */
 } cluster_endpoint_type;
 
-/* RDB active child save type. */
-#define RDB_CHILD_TYPE_NONE 0
-#define RDB_CHILD_TYPE_DISK 1   /* RDB is written to disk. */
-#define RDB_CHILD_TYPE_SOCKET 2 /* RDB is written to replica socket. */
+/* RDB write target type. */
+#define RDB_WRITE_TARGET_NONE 0
+#define RDB_WRITE_TARGET_DISK 1   /* RDB is written to disk. */
+#define RDB_WRITE_TARGET_SOCKET 2 /* RDB is written to replica socket. */
 
 /* RDB bgsave type. */
 #define RDB_BGSAVE_TYPE_NONE 0
@@ -2078,7 +2078,7 @@ struct valkeyServer {
     time_t rdb_save_time_last;            /* Time used by last RDB save run. */
     time_t rdb_save_time_start;           /* Current RDB save start time. */
     int rdb_bgsave_scheduled;             /* BGSAVE when possible if non-zero. Type: RDB_BGSAVE_TYPE_* */
-    int rdb_child_type;                   /* Type of save by active child. */
+    int rdb_write_target;                 /* Type of save by active child. */
     int cur_bgsave_type;                  /* Current bgsave type: RDB_BGSAVE_TYPE_* */
     int lastbgsave_type;                  /* RDB_BGSAVE_TYPE_* */
     int lastbgsave_status;                /* C_OK or C_ERR */

@@ -847,7 +847,7 @@ int hasActiveChildProcess(void) {
 }
 
 int isSaveInProgress(void) {
-    return server.rdb_child_type != RDB_CHILD_TYPE_NONE;
+    return server.rdb_write_target != RDB_WRITE_TARGET_NONE;
 }
 
 void resetChildState(void) {
@@ -3013,7 +3013,7 @@ void initServer(void) {
     server.client_pause_in_transaction = 0;
     server.child_pid = -1;
     server.child_type = CHILD_TYPE_NONE;
-    server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    server.rdb_write_target = RDB_WRITE_TARGET_NONE;
     server.rdb_pipe_conns = NULL;
     server.rdb_pipe_numconns = 0;
     server.rdb_pipe_numconns_writing = 0;

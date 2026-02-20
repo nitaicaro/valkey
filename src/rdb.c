@@ -1696,7 +1696,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
         }
         serverLog(LL_NOTICE, "Background saving started by pid %ld", (long)childpid);
         server.rdb_save_time_start = time(NULL);
-        server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+        server.rdb_write_target = RDB_WRITE_TARGET_DISK;
         server.cur_bgsave_type = RDB_BGSAVE_TYPE_FORK;
         return C_OK;
     }
@@ -3656,16 +3656,16 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
 
 /* When a background RDB saving/transfer terminates, call the right handler. */
 void backgroundSaveDoneHandler(int exitcode, int bysignal) {
-    int type = server.rdb_child_type;
+    int type = server.rdb_write_target;
     time_t save_end = time(NULL);
 
-    switch (server.rdb_child_type) {
-    case RDB_CHILD_TYPE_DISK: backgroundSaveDoneHandlerDisk(exitcode, bysignal, save_end); break;
-    case RDB_CHILD_TYPE_SOCKET: backgroundSaveDoneHandlerSocket(exitcode, bysignal); break;
+    switch (server.rdb_write_target) {
+    case RDB_WRITE_TARGET_DISK: backgroundSaveDoneHandlerDisk(exitcode, bysignal, save_end); break;
+    case RDB_WRITE_TARGET_SOCKET: backgroundSaveDoneHandlerSocket(exitcode, bysignal); break;
     default: serverPanic("Unknown RDB child type."); break;
     }
 
-    server.rdb_child_type = RDB_CHILD_TYPE_NONE;
+    server.rdb_write_target = RDB_WRITE_TARGET_NONE;
     server.cur_bgsave_type = RDB_BGSAVE_TYPE_NONE;
     server.rdb_save_time_last = save_end - server.rdb_save_time_start;
     server.rdb_save_time_start = -1;
@@ -3852,7 +3852,7 @@ int rdbSaveToReplicasSockets(int req, int rdbver, rdbSaveInfo *rsi) {
                       skip_rdb_checksum ? " while skipping RDB checksum for this transfer" : "");
 
             server.rdb_save_time_start = time(NULL);
-            server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
+            server.rdb_write_target = RDB_WRITE_TARGET_SOCKET;
             if (dual_channel) {
                 /* For dual channel sync, the main process no longer requires these RDB connections. */
                 zfree(conns);
