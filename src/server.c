@@ -4854,6 +4854,10 @@ int finishShutdown(void) {
          * but OS will close this fd when process exits. */
         rdbRemoveTempFile(server.child_pid, 0);
     }
+    if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) {
+        serverLog(LL_WARNING, "There is a thread saving an .rdb. Cancelling it!");
+        threadsaveCancel();
+    }
 
     /* Kill module child if there is one. */
     if (server.child_type == CHILD_TYPE_MODULE) {
