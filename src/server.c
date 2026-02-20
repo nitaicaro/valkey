@@ -820,7 +820,7 @@ void updateDictResizePolicy(void) {
     if (server.in_fork_child != CHILD_TYPE_NONE || !server.dict_resizing) {
         dictSetResizeEnabled(DICT_RESIZE_FORBID);
         hashtableSetResizePolicy(HASHTABLE_RESIZE_FORBID);
-    } else if (hasActiveChildProcess() || isSaveInProgress()) {
+    } else if (hasActiveChildProcess()) {
         dictSetResizeEnabled(DICT_RESIZE_AVOID);
         hashtableSetResizePolicy(HASHTABLE_RESIZE_AVOID);
     } else {
@@ -1300,7 +1300,7 @@ void databasesCron(void) {
     /* Perform hash tables rehashing if needed, but only if there are no
      * other processes saving the DB on disk. Otherwise rehashing is bad
      * as will cause a lot of copy-on-write of memory pages. */
-    if (!hasActiveChildProcess()) {
+    if (!hasActiveChildProcess() && !isSaveInProgress()) {
         /* We use global counters so if we stop the computation at a given
          * DB we'll be able to start from the successive in the next
          * cron loop iteration. */
@@ -1595,7 +1595,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
-    if (!hasActiveChildProcess() && server.aof_rewrite_scheduled && !aofRewriteLimited()) {
+    if (!hasActiveChildProcess() && !isSaveInProgress() && server.aof_rewrite_scheduled && !aofRewriteLimited()) {
         rewriteAppendOnlyFileBackground();
     }
 
@@ -1603,7 +1603,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
     if (hasActiveChildProcess() || scriptingEngineDebuggerPendingChildren()) {
         run_with_period(1000) receiveChildInfo();
         checkChildrenDone();
-    } else {
+    } else if (!isSaveInProgress()) {
         /* If there is not a background saving/rewrite in progress check if
          * we have to save/rewrite now. */
         for (j = 0; j < server.saveparamslen; j++) {
@@ -1630,7 +1630,7 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
         }
 
         /* Trigger an AOF rewrite if needed. */
-        if (server.aof_state == AOF_ON && !hasActiveChildProcess() && server.aof_rewrite_perc &&
+        if (server.aof_state == AOF_ON && !hasActiveChildProcess() && !isSaveInProgress() && server.aof_rewrite_perc &&
             server.aof_current_size > server.aof_rewrite_min_size) {
             long long base = server.aof_rewrite_base_size ? server.aof_rewrite_base_size : 1;
             long long growth = (server.aof_current_size * 100 / base) - 100;

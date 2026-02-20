@@ -1212,7 +1212,7 @@ void syncCommand(client *c) {
     }
 
     /* CASE 1: BGSAVE is in progress, with disk target. */
-    if (server.child_type == CHILD_TYPE_RDB && server.rdb_write_target == RDB_WRITE_TARGET_DISK) {
+    if (server.rdb_write_target == RDB_WRITE_TARGET_DISK) {
         /* Ok a background save is in progress. Let's check if it is a good
          * one for replication, i.e. if there is another replica that is
          * registering differences since the server forked to save. */
@@ -1247,7 +1247,7 @@ void syncCommand(client *c) {
         }
 
         /* CASE 2: BGSAVE is in progress, with socket target. */
-    } else if (server.child_type == CHILD_TYPE_RDB && server.rdb_write_target == RDB_WRITE_TARGET_SOCKET) {
+    } else if (server.rdb_write_target == RDB_WRITE_TARGET_SOCKET) {
         /* There is an RDB child process but it is writing directly to
          * children sockets. We need to wait for the next BGSAVE
          * in order to synchronize. */
@@ -5375,7 +5375,7 @@ int shouldStartChildReplication(int *mincapa_out, int *req_out, int *rdbver_out)
      * In case of diskless replication, we make sure to wait the specified
      * number of seconds (according to configuration) so that other replicas
      * have the time to arrive before we start streaming. */
-    if (!hasActiveChildProcess()) {
+    if (!hasActiveChildProcess() && !isSaveInProgress()) {
         time_t idle, max_idle = 0;
         int replicas_waiting = 0;
         int mincapa;
