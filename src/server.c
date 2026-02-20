@@ -846,8 +846,16 @@ int hasActiveChildProcess(void) {
     return server.child_pid != -1;
 }
 
+int isForkBgsaveInProgress(void) {
+    return server.child_type == CHILD_TYPE_RDB;
+}
+
+int isThreadBgsaveInProgress(void) {
+    return server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD;
+}
+
 int isSaveInProgress(void) {
-    return server.rdb_write_target != RDB_WRITE_TARGET_NONE;
+    return isForkBgsaveInProgress() || isThreadBgsaveInProgress();
 }
 
 void resetChildState(void) {
@@ -4843,7 +4851,7 @@ int finishShutdown(void) {
     /* Kill the saving child if there is a background saving in progress.
        We want to avoid race conditions, for instance our saving child may
        overwrite the synchronous saving did by SHUTDOWN. */
-    if (server.child_type == CHILD_TYPE_RDB) {
+    if (isForkBgsaveInProgress()) {
         serverLog(LL_WARNING, "There is a child saving an .rdb. Killing it!");
         killRDBChild();
         /* Note that, in killRDBChild normally has backgroundSaveDoneHandler
@@ -4854,7 +4862,7 @@ int finishShutdown(void) {
          * but OS will close this fd when process exits. */
         rdbRemoveTempFile(server.child_pid, 0);
     }
-    if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) {
+    if (isThreadBgsaveInProgress()) {
         serverLog(LL_WARNING, "There is a thread saving an .rdb. Cancelling it!");
         threadsaveCancel();
     }

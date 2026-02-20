@@ -13694,8 +13694,8 @@ int VM_RdbLoad(ValkeyModuleCtx *ctx, ValkeyModuleRdbStream *stream, int flags) {
 
     /* Kill existing RDB fork as it is saving outdated data. Also killing it
      * will prevent COW memory issue. */
-    if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
-    if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) threadsaveCancel();
+    if (isForkBgsaveInProgress()) killRDBChild();
+    if (isThreadBgsaveInProgress()) threadsaveCancel();
 
     /* Kill existing slot migration fork as it is saving outdated data. Also killing it
      * will prevent COW memory issue. */

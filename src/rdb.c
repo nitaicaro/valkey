@@ -3910,12 +3910,12 @@ void bgsaveCommand(client *c) {
                 return;
             }
             /* Terminates an in progress BGSAVE */
-            if (server.child_type == CHILD_TYPE_RDB) {
+            if (isForkBgsaveInProgress()) {
                 /* There is an ongoing fork-based bgsave */
                 serverLog(LL_NOTICE, "Background saving (fork) will be aborted due to user request");
                 killRDBChild();
                 addReplyStatus(c, "Background saving cancelled");
-            } else if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) {
+            } else if (isThreadBgsaveInProgress()) {
                 /* There is an ongoing threadsave */
                 serverLog(LL_NOTICE, "Background saving (thread) will be aborted due to user request");
                 threadsaveCancel();
