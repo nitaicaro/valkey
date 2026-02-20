@@ -815,7 +815,7 @@ int getFlushCommandFlags(client *c, int *flags) {
 void flushAllDataAndResetRDB(int flags) {
     server.dirty += emptyData(-1, flags, NULL);
     if (server.child_type == CHILD_TYPE_RDB) killRDBChild();
-    if (server.cur_bgsave_type != RDB_BGSAVE_TYPE_NONE) threadsaveCancel();
+    if (server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD) threadsaveCancel();
     if (server.child_type == CHILD_TYPE_SLOT_MIGRATION) killSlotMigrationChild();
     if (server.saveparamslen > 0) {
         rdbSaveInfo rsi, *rsiptr;
