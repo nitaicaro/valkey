@@ -1263,6 +1263,25 @@ start_server {overrides {forkless-options-supported yes}} {
         r select 0
     } {} {needs:debug}
 
+    test "thread bgsave writes valkey-threadsave-version AUX field" {
+        r flushall
+        r config set save ""
+        
+        r set k1 v1
+        r set k2 v2
+        
+        # Perform thread bgsave
+        r bgsave thread
+        waitForBgsave r
+        
+        # Check RDB file
+        set rdb_path [lindex [r config get dir] 1]/[lindex [r config get dbfilename] 1]
+        set rdb_content [exec cat $rdb_path]
+        
+        # Verify valkey-threadsave-version AUX field exists in RDB
+        assert {[string first "valkey-threadsave-version" $rdb_content] != -1}
+    } {} {needs:debug}
+
     foreach first_type {fork thread} {
         foreach second_type {fork thread} {
             test "$first_type bgsave blocks $second_type bgsave" {
