@@ -1588,4 +1588,53 @@ start_server {} {
     }
 }
 
+start_server {} {
+    test {threadsave-enabled-for-backup requires forkless-options-supported} {
+        catch {r config set threadsave-enabled-for-backup yes} err
+        assert_match "*forkless-options-supported*" $err
+    }
+}
+
+start_server {overrides {forkless-options-supported yes}} {
+    test {threadsave-enabled-for-backup can be enabled with forkless-options-supported} {
+        r config set threadsave-enabled-for-backup yes
+        assert_equal [lindex [r config get threadsave-enabled-for-backup] 1] "yes"
+    }
+}
+
+start_server {} {
+    test {BGSAVE THREAD requires forkless-options-supported} {
+        catch {r bgsave thread} err
+        assert_match "*forkless-options-supported*" $err
+    }
+}
+
+start_server {overrides {forkless-options-supported yes}} {
+    test {BGSAVE THREAD works with forkless-options-supported} {
+        r bgsave thread
+        waitForBgsave r
+        assert_equal [s rdb_last_bgsave_type] "thread"
+    }
+}
+
+start_server {overrides {forkless-options-supported yes threadsave-enabled-for-backup yes}} {
+    test {BGSAVE uses thread when threadsave-enabled-for-backup is yes} {
+        r set key value
+        set result [r bgsave]
+        assert_match "*thread*" $result
+        waitForBgsave r
+        assert_equal [s rdb_last_bgsave_type] "thread"
+    }
+}
+
+start_server {overrides {threadsave-enabled-for-backup no}} {
+    test {BGSAVE uses fork when threadsave-enabled-for-backup is no} {
+        r set key value
+        set result [r bgsave]
+        assert_match "*fork*" $result
+        waitForBgsave r
+        assert_equal [s rdb_last_bgsave_type] "fork"
+    }
+}
+
 } ;# tags

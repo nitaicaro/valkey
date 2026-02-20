@@ -3890,7 +3890,7 @@ void saveCommand(client *c) {
 /* BGSAVE [SCHEDULE [FORK|THREAD]] | BGSAVE [FORK|THREAD] | BGSAVE CANCEL */
 void bgsaveCommand(client *c) {
     int schedule = 0;
-    int use_threadsave = 0;
+    int chosen_save_type = RDB_BGSAVE_TYPE_NONE;
 
     /* BGSAVE can be invoked with the following options:
      * - CANCEL: terminates an in-progress or scheduled BGSAVE (standalone only)
@@ -3929,13 +3929,22 @@ void bgsaveCommand(client *c) {
             }
             return;
         } else if (!strcasecmp(arg, "fork")) {
-            use_threadsave = 0;
+            chosen_save_type = RDB_BGSAVE_TYPE_FORK;
         } else if (!strcasecmp(arg, "thread")) {
-            use_threadsave = 1;
+            if (!server.forkless_options_supported) {
+                addReplyError(c, "BGSAVE THREAD requires starting the server with forkless-options-supported enabled");
+                return;
+            }
+            chosen_save_type = RDB_BGSAVE_TYPE_THREAD;
         } else {
             addReplyErrorObject(c, shared.syntaxerr);
             return;
         }
+    }
+
+    /* If user didn't explicitly specify save type, let the system choose */
+    if (chosen_save_type == RDB_BGSAVE_TYPE_NONE) {
+        chosen_save_type = server.threadsave_enabled_for_backup ? RDB_BGSAVE_TYPE_THREAD : RDB_BGSAVE_TYPE_FORK;
     }
 
     rdbSaveInfo rsi, *rsiptr;
@@ -3945,7 +3954,7 @@ void bgsaveCommand(client *c) {
         addReplyError(c, "Background save already in progress");
     } else if (hasActiveChildProcess() || server.in_exec) {
         if (schedule || server.in_exec) {
-            server.rdb_bgsave_scheduled = use_threadsave ? RDB_BGSAVE_TYPE_THREAD : RDB_BGSAVE_TYPE_FORK;
+            server.rdb_bgsave_scheduled = chosen_save_type;
             if (schedule) {
                 serverLog(LL_NOTICE, "Background saving scheduled due to user request");
             } else {
@@ -3957,7 +3966,7 @@ void bgsaveCommand(client *c) {
                              "Use BGSAVE SCHEDULE in order to schedule a BGSAVE whenever "
                              "possible.");
         }
-    } else if (use_threadsave && threadsaveToDisk(server.rdb_filename) == C_OK) {
+    } else if (chosen_save_type == RDB_BGSAVE_TYPE_THREAD && threadsaveToDisk(server.rdb_filename) == C_OK) {
         addReplyStatus(c, "Background saving (thread) started");
     } else if (rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE) == C_OK) {
         addReplyStatus(c, "Background saving (fork) started");
