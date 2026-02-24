@@ -6443,6 +6443,40 @@ sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
                     "loading_loaded_perc:%.2f\r\n", perc,
                     "loading_eta_seconds:%jd\r\n", (intmax_t)eta));
         }
+
+        /* Threadsave / bgiteration metrics */
+        bgIterator *iter = NULL;
+        bgIteratorStatus status = {0};
+        long long estimated_seconds_remaining = -1;
+        long long current_item_seconds = -1;
+
+        if (onRedisMainThread() && (iter = bgIteratorFind(THREADSAVE_FILE_ITER_NAME)) != NULL) {
+            bgIteratorGetStatus(iter, &status);
+
+            long long total_keys = 0;
+            for (int i = 0; i < server.dbnum; i++) {
+                total_keys += server.db[i] ? dbSize(server.db[i]) : 0;
+            }
+
+            estimated_seconds_remaining = (status.dbentries_processed == 0) ? 0
+                    : (total_keys - status.dbentries_processed) * status.runtime_ms
+                          / status.dbentries_processed / 1000;
+            current_item_seconds = status.current_item_ms / 1000;
+        }
+
+        info = sdscatprintf(info,
+                "threadsave_current_item_seconds:%lld\r\n"
+                "threadsave_current_queue_length:%lu\r\n"
+                "threadsave_queue_length_target:%lu\r\n"
+                "threadsave_estimated_seconds_remaining:%lld\r\n"
+                "threadsave_dbentries_queued:%lu\r\n"
+                "threadsave_dbentries_processed:%lu\r\n",
+                current_item_seconds,
+                status.queue_length,
+                status.queue_length_target,
+                estimated_seconds_remaining,
+                status.dbentries_queued,
+                status.dbentries_processed);
     }
 
     /* Stats */
