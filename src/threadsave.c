@@ -161,6 +161,9 @@ static void cleanupSaveInfoAndEmitEndMetrics(threadsaveInfo *saveInfo) {
     stopSaving(saveInfo->err_code == C_OK);
     currentThreadsave = NULL;
 
+    /* Notify replicas waiting for BGSAVE to complete */
+    updateReplicasWaitingBgsave(saveInfo->err_code, RDB_WRITE_TARGET_DISK);
+
     serverAssert(saveInfo->temp_file == NULL);
     zfree(saveInfo);
 }
