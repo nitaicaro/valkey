@@ -3320,6 +3320,8 @@ void receiveChildInfo(void);
 int serverFork(int purpose);
 int hasActiveChildProcess(void);
 int isSaveInProgress(void);
+int isForkBgsaveInProgress(void);
+int isThreadBgsaveInProgress(void);
 void resetChildState(void);
 int isMutuallyExclusiveChildType(int type);
 
