@@ -2523,14 +2523,6 @@ static int updateDefragConfiguration(const char **err) {
     return 1;
 }
 
-static int updateThreadsaveEnabledForBackup(const char **err) {
-    if (server.threadsave_enabled_for_backup && !server.forkless_options_supported) {
-        *err = "threadsave-enabled-for-backup requires starting the server with forkless-options-supported enabled";
-        return 0;
-    }
-    return 1;
-}
-
 static int updateJemallocBgThread(const char **err) {
     UNUSED(err);
     set_jemalloc_bg_thread(server.jemalloc_bg_thread);
@@ -3217,7 +3209,7 @@ standardConfig static_configs[] = {
     createBoolConfig("rdb-del-sync-files", NULL, MODIFIABLE_CONFIG, server.rdb_del_sync_files, 0, NULL, NULL),
     createBoolConfig("activerehashing", NULL, MODIFIABLE_CONFIG, server.activerehashing, 1, NULL, NULL),
     createBoolConfig("stop-writes-on-bgsave-error", NULL, MODIFIABLE_CONFIG, server.stop_writes_on_bgsave_err, 1, NULL, NULL),
-    createBoolConfig("threadsave-enabled-for-backup", NULL, MODIFIABLE_CONFIG, server.threadsave_enabled_for_backup, 0, NULL, updateThreadsaveEnabledForBackup),
+    createBoolConfig("threadsave-enabled-for-backup", NULL, MODIFIABLE_CONFIG, server.threadsave_enabled_for_backup, 0, NULL, NULL),
     createBoolConfig("set-proc-title", NULL, IMMUTABLE_CONFIG, server.set_proc_title, 1, NULL, NULL), /* Should setproctitle be used? */
     createBoolConfig("lazyfree-lazy-eviction", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.lazyfree_lazy_eviction, 1, NULL, NULL),
     createBoolConfig("lazyfree-lazy-expire", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.lazyfree_lazy_expire, 1, NULL, NULL),

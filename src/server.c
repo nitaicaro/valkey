@@ -1627,8 +1627,8 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
                 serverLog(LL_NOTICE, "%d changes in %d seconds. Saving...", sp->changes, (int)sp->seconds);
                 rdbSaveInfo rsi, *rsiptr;
                 rsiptr = rdbPopulateSaveInfo(&rsi);
-                /* Use threadsave if enabled, otherwise use fork */
-                if (server.threadsave_enabled_for_backup) {
+                /* Use threadsave if enabled and forkless_options_supported, otherwise use fork */
+                if (server.threadsave_enabled_for_backup && server.forkless_options_supported) {
                     threadsaveToDisk(server.rdb_filename);
                 } else {
                     rdbSaveBackground(REPLICA_REQ_NONE, server.rdb_filename, rsiptr, RDBFLAGS_NONE);
