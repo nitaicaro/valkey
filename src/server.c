@@ -4549,6 +4549,159 @@ int commandCheckArity(struct serverCommand *cmd, int argc, sds *err) {
     return 1;
 }
 
+/* Read a RESP multi-bulk header (*<argc>\r\n) through read_fn and return the
+ * argument count in *argc_out.
+ *
+ * read_fn must read exactly len bytes into buf and return len on success or 0
+ * on failure (same contract as rioRead). ctx is passed back untouched so the
+ * source (rio, FILE, ...) is opaque to this parser.
+ *
+ * Returns RESP_PARSE_OK with *argc_out set, RESP_PARSE_EOF if the bytes could
+ * not be read, or RESP_PARSE_FMTERR if the header is malformed. */
+respParseResult parseRespHeaderFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx,
+                                          int *argc_out) {
+    char buf[128];
+
+    if (read_fn(ctx, buf, 1) == 0) return RESP_PARSE_EOF;
+    if (buf[0] != '*') return RESP_PARSE_FMTERR;
+    int pos = 0;
+    while (pos < (int)sizeof(buf) - 1) {
+        if (read_fn(ctx, buf + pos, 1) == 0) return RESP_PARSE_EOF;
+        if (buf[pos] == '\n') break;
+        pos++;
+    }
+    buf[pos] = '\0'; /* overwrite \n; buf may have a trailing \r */
+    int argc = atoi(buf);
+    if (argc < 1) return RESP_PARSE_FMTERR;
+    *argc_out = argc;
+    return RESP_PARSE_OK;
+}
+
+/* Read argc RESP arguments ($<len>\r\n<data>\r\n each) through read_fn into a
+ * freshly allocated argv, returned in *argv_out. The caller must already know
+ * argc (see parseRespHeaderFromReader) and owns argv and its objects on OK.
+ *
+ * read_fn has the same contract as in parseRespHeaderFromReader. Returns
+ * RESP_PARSE_OK, RESP_PARSE_EOF, or RESP_PARSE_FMTERR; on error any partial
+ * allocation is freed and *argv_out is left untouched. */
+respParseResult parseRespArgsFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx, int argc,
+                                        robj ***argv_out) {
+    char buf[128];
+    int j;
+    respParseResult result;
+
+    robj **argv = zmalloc(sizeof(robj *) * argc);
+    for (j = 0; j < argc; j++) {
+        if (read_fn(ctx, buf, 1) == 0) {
+            result = RESP_PARSE_EOF;
+            goto err;
+        }
+        if (buf[0] != '$') {
+            result = RESP_PARSE_FMTERR;
+            goto err;
+        }
+        int pos = 0;
+        while (pos < (int)sizeof(buf) - 1) {
+            if (read_fn(ctx, buf + pos, 1) == 0) {
+                result = RESP_PARSE_EOF;
+                goto err;
+            }
+            if (buf[pos] == '\n') break;
+            pos++;
+        }
+        buf[pos] = '\0';
+        long len = strtol(buf, NULL, 10);
+
+        sds argsds = sdsnewlen(SDS_NOINIT, len);
+        if (len && read_fn(ctx, argsds, len) == 0) {
+            sdsfree(argsds);
+            result = RESP_PARSE_EOF;
+            goto err;
+        }
+        argv[j] = createObject(OBJ_STRING, argsds);
+
+        /* Discard the trailing \r\n. */
+        char crlf[2];
+        if (read_fn(ctx, crlf, 2) == 0) {
+            j++; /* argv[j] was assigned above; free it too. */
+            result = RESP_PARSE_EOF;
+            goto err;
+        }
+    }
+
+    *argv_out = argv;
+    return RESP_PARSE_OK;
+
+err:
+    for (int k = 0; k < j; k++) decrRefCount(argv[k]);
+    zfree(argv);
+    return result;
+}
+
+/* Run one command that has already been parsed into argv/argc, using a fake
+ * client. This is used when we replay commands while loading data. The fake
+ * client sends no reply and is never allowed to block.
+ *
+ * The fake client takes over argv. When this function returns, argv has
+ * already been freed (running the command can change argv, so we free the
+ * client's own argv, not the pointer that was passed in).
+ *
+ * If is_multi_start is not NULL, it is set to 1 when the command is a MULTI
+ * (the start of a transaction). If is_multi_start is NULL, the caller is
+ * replaying individual commands and MULTI/EXEC commands are skipped instead
+ * of run.
+ *
+ * Returns C_OK if the command ran. Returns C_ERR if the command name is not
+ * known, or the number of arguments is wrong. In that case *err is set to a
+ * short message that the caller must free. */
+int loadCommandFromArgv(client *fakeClient, robj **argv, int argc, int *is_multi_start, sds *err) {
+    struct serverCommand *cmd;
+
+    if (is_multi_start) *is_multi_start = 0;
+
+    fakeClient->argc = argc;
+    fakeClient->argv = argv;
+    fakeClient->argv_len = argc;
+
+    fakeClient->cmd = fakeClient->lastcmd = cmd = lookupCommand(argv, argc);
+    if ((!cmd && !commandCheckExistence(fakeClient, err)) || (cmd && !commandCheckArity(cmd, argc, err))) {
+        freeClientArgv(fakeClient);
+        return C_ERR;
+    }
+
+    if (is_multi_start && cmd->proc == multiCommand) *is_multi_start = 1;
+
+    /* A caller that does not track transactions (is_multi_start == NULL) is
+     * replaying individual commands. Skip MULTI/EXEC framing so each command
+     * applies immediately instead of being queued into a transaction. */
+    if (is_multi_start == NULL && (cmd->proc == multiCommand || cmd->proc == execCommand)) {
+        serverLog(LL_DEBUG, "Skipping %s command while replaying individual commands", cmd->fullname);
+        freeClientArgv(fakeClient);
+        return C_OK;
+    }
+
+    /* Run the command in the context of a fake client */
+    if (fakeClient->flag.multi && fakeClient->cmd->proc != execCommand) {
+        /* Note: we don't have to attempt calling evalGetCommandFlags,
+         * since this is a replay, the checks in processCommand are not made
+         * anyway.*/
+        queueMultiCommand(fakeClient, cmd->flags);
+    } else {
+        cmd->proc(fakeClient);
+    }
+
+    /* The fake client should not have a reply */
+    serverAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
+
+    /* The fake client should never get blocked */
+    serverAssert(fakeClient->flag.blocked == 0);
+
+    /* Clean up. Command code may have changed argv/argc so we use the
+     * argv/argc of the client instead of the local variables. */
+    freeClientArgv(fakeClient);
+    return C_OK;
+}
+
 /* If we're executing a script, try to extract a set of command flags from
  * it, in case it declared them. Note this is just an attempt, we don't yet
  * know the script command is well formed.*/
