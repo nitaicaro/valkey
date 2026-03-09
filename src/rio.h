@@ -46,6 +46,10 @@
 #define RIO_TYPE_BUFFER (1 << 1)
 #define RIO_TYPE_CONN (1 << 2)
 #define RIO_TYPE_FD (1 << 3)
+#define RIO_TYPE_REPLICACOB (1 << 4)
+#define RIO_TYPE_CONNSET (1 << 5)
+
+#define RIO_REPLICA_COB_BUF_LEN (NET_MAX_WRITES_PER_EVENT-sizeof(struct sdshdr16)-1)
 
 struct _rio {
     /* Backend functions.
@@ -107,6 +111,11 @@ struct _rio {
             off_t pos;
             sds buf;
         } connset;
+        /* Client output buffer target (for replica replication). */
+        struct {
+            char *buf;
+            off_t pos;
+        } replicacob;
     } io;
 };
 
@@ -205,4 +214,8 @@ void rioSetReclaimCache(rio *r, int enabled);
 uint8_t rioCheckType(rio *r);
 void rioInitWithConnset(rio *r, connection **conns, int numconns);
 void rioFreeConnset(rio *r);
+void rioFreeConnectionFromConnset(rio *r, connection *conn_to_free);
+void rioInitWithReplicaCOB(rio *r);
+void rioFreeReplicaCOB(rio *r);
+unsigned long long getCOBSizeForRDBBytes(unsigned long long rdb_bytes);
 #endif
