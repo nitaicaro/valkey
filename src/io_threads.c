@@ -457,7 +457,7 @@ int trySendWriteToIOThreads(client *c) {
     serverAssert(c->clients_pending_write_node.prev == NULL && c->clients_pending_write_node.next == NULL);
     listLinkNodeTail(server.clients_pending_io_write, &c->clients_pending_write_node);
 
-    int is_replica = getClientType(c) == CLIENT_TYPE_REPLICA;
+    int is_replica = getClientType(c) == CLIENT_TYPE_REPLICA && !c->repl_data->using_cob;
     if (is_replica) {
         c->io_last_reply_block = listLast(server.repl_buffer_blocks);
         replBufBlock *o = listNodeValue(c->io_last_reply_block);
@@ -478,6 +478,7 @@ int trySendWriteToIOThreads(client *c) {
             /* If buffer is encoded force new header */
             if (c->flag.buf_encoded) c->last_header = NULL;
         }
+        getClientWritePosition(c, &c->io_last_reply_block, &c->io_last_bufpos);
     }
 
     serverAssert(c->bufpos > 0 || c->io_last_bufpos > 0 || is_replica);
