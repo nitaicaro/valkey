@@ -32,6 +32,7 @@
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "script.h"
+#include "threadsave.h"
 #include "intset.h"
 #include "sds.h"
 #include "fpconv_dtoa.h"
@@ -399,11 +400,15 @@ void putClientInPendingWriteQueue(client *c) {
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
      * writes at this stage. */
+    if (c->flag.replica && c->repl_data && c->repl_data->stop_send_data_until_ack) return;
     if (!c->flag.pending_write &&
-        (!c->repl_data ||
-         c->repl_data->repl_state == REPL_STATE_NONE ||
-         (isReplicaReadyForReplData(c) && !c->repl_data->repl_start_cmd_stream_on_ack)) &&
-        clusterSlotMigrationShouldInstallWriteHandler(c)) {
+        (((!c->repl_data ||
+          c->repl_data->repl_state == REPL_STATE_NONE ||
+          (isReplicaReadyForReplData(c) && !c->repl_data->repl_start_cmd_stream_on_ack)) &&
+         clusterSlotMigrationShouldInstallWriteHandler(c)) ||
+        (!c->repl_data || (c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END &&
+            server.rdb_write_target == RDB_WRITE_TARGET_SOCKET &&
+            server.cur_bgsave_type == RDB_BGSAVE_TYPE_THREAD)))) {
         /* Here instead of installing the write handler, we just flag the
          * client and put it into a list of clients that have something
          * to write to the socket. This way before re-entering the event
@@ -698,8 +703,10 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
      * replication link that caused a reply to be generated we'll simply disconnect it.
      * Note this is the simplest way to check a command added a response. Replication links are used to write data but
-     * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+     * not for responses, so we should normally never get here on a replica client.
+     * Exception: during threadsave-to-socket, we use the COB to send RDB data to replicas. */
+    if (getClientType(c) == CLIENT_TYPE_REPLICA &&
+        !(c->repl_data && c->repl_data->using_cob)) {
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
         logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
                                         cmdname ? cmdname : "<unknown>");
@@ -1712,6 +1719,11 @@ void copyReplicaOutputBuffer(client *dst, client *src) {
  * the socket. */
 int clientHasPendingReplies(client *c) {
     if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+        /* Replicas using private COB (during threadsave-to-socket) check
+         * the private buffer, not the shared replication buffer. */
+        if (c->repl_data && c->repl_data->using_cob) {
+            return c->bufpos > 0 || listLength(c->reply) > 0;
+        }
         /* Replicas use global shared replication buffer instead of
          * private output buffer. */
         serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
@@ -2060,6 +2072,33 @@ void freeClient(client *c) {
         return;
     }
 
+    /* If threadsave owns this client, don't free it — threadsave will handle it. */
+    if (c->flag.threadsave_managed) {
+        if (c->flag.close_asap) return; /* Already marked, don't double-process. */
+
+        serverLog(LL_NOTICE,
+                  "freeClient: master trying to free client(%llu) owned by threadsave",
+                  (unsigned long long)c->id);
+
+        /* Remove from server.replicas now so disconnectReplicas() won't block on it. */
+        list *client_list = (c->flag.monitor) ? server.monitors : server.replicas;
+        listNode *ln = listSearchKey(client_list, c);
+        serverAssert(ln != NULL);
+        listDelNode(client_list, ln);
+
+        if (!(c->flag.monitor)) {
+            if (listLength(server.replicas) == 0) server.repl_no_replicas_since = server.unixtime;
+            refreshGoodReplicasCount();
+        }
+        c->flag.replica = 0;
+        c->flag.monitor = 0;
+
+        freeReplicaReferencedReplBuffer(c);
+
+        c->flag.close_asap = 1;
+        return;
+    }
+
     /* Wait for IO operations to be done before proceeding */
     waitForClientIO(c);
 
@@ -2092,8 +2131,13 @@ void freeClient(client *c) {
         if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
             c->flag.close_asap = 0;
             c->flag.close_after_reply = 0;
-            replicationCachePrimary(c);
-            return;
+            if (server.wait_for_psync_offset) {
+                serverLog(LL_NOTICE, "Not caching primary state because replica doesn't have correct replication offset for psync.");
+                server.wait_for_psync_offset = 0;
+            } else {
+                replicationCachePrimary(c);
+                return;
+            }
         }
     }
 
@@ -2332,6 +2376,10 @@ int freeClientsInAsyncFreeQueue(void) {
         }
 
         if (c->flag.protected) continue;
+
+        /* Don't free clients owned by threadsave — they'll be freed when
+         * threadsave completes or abandons them. */
+        if (c->flag.threadsave_managed) continue;
 
         c->flag.close_asap = 0;
         freeClient(c);
@@ -2668,8 +2716,7 @@ static int writevToClient(client *c) {
     size_t bufpos = 0;
     listNode *lastblock;
     if (inMainThread()) {
-        lastblock = listLast(c->reply);
-        bufpos = c->bufpos;
+        getClientWritePosition(c, &lastblock, &bufpos);
     } else {
         lastblock = c->io_last_reply_block;
         bufpos = lastblock ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -2685,8 +2732,9 @@ static int writevToClient(client *c) {
 
     /* If the static reply buffer is not empty,
      * add it to the iov array for writev() as well. */
-    if (bufpos > 0) {
-        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, bufpos, &reply, &buf_metadata[bufcnt++]);
+    if (c->bufpos > 0) {
+        ssize_t offset = lastblock ? c->bufpos : bufpos;
+        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, offset, &reply, &buf_metadata[bufcnt++]);
     }
 
     if (lastblock) {
@@ -2765,9 +2813,8 @@ int _writeToClient(client *c) {
     size_t bufpos;
 
     if (inMainThread()) {
-        /* In the main thread, access bufpos and lastblock directly */
-        lastblock = listLast(c->reply);
-        bufpos = (size_t)c->bufpos;
+        /* In the main thread, access bufpos and lastblock directly. */
+        getClientWritePosition(c, &lastblock, &bufpos);
     } else {
         /* If there is a last block, use bufpos directly; otherwise, use io_last_bufpos */
         bufpos = c->io_last_reply_block ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -2905,15 +2952,54 @@ static void _postWriteToClient(client *c) {
 /* Updates the client's memory usage and bucket and server stats after writing.
  * If a write handler is installed , it will attempt to clear the write event.
  * If the client is no longer valid, it will return C_ERR, otherwise C_OK. */
+/* Record the current COB position as the point at which to stop sending and
+ * wait for an ACK from the replica. Called on the main thread after writing
+ * the RDB end marker into the COB. */
+void getClientWritePosition(client *c, listNode **block, size_t *bufpos) {
+    if (c->repl_data && c->repl_data->cob_pause_bufpos > 0) {
+        *block = NULL;
+        *bufpos = c->repl_data->cob_pause_bufpos;
+        return;
+    }
+
+    if (c->repl_data && c->repl_data->cob_pause_tail != NULL) {
+        *block = c->repl_data->cob_pause_tail;
+        *bufpos = c->repl_data->cob_pause_objlen;
+        return;
+    }
+
+    *block = listLast(c->reply);
+    if (*block) {
+        clientReplyBlock *o = listNodeValue(*block);
+        *bufpos = o->used;
+    } else {
+        *bufpos = c->bufpos;
+    }
+}
+
+void pauseCobSendAtCurrentPositionForAck(client *c) {
+    serverAssert(c->repl_data);
+    serverAssert(c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END);
+
+    if (listLength(c->reply) > 0) {
+        c->repl_data->cob_pause_tail = listLast(c->reply);
+        clientReplyBlock *obj = listNodeValue(c->repl_data->cob_pause_tail);
+        c->repl_data->cob_pause_objlen = obj->used;
+    } else {
+        c->repl_data->cob_pause_bufpos = c->bufpos;
+    }
+}
+
 int postWriteToClient(client *c) {
     c->io_last_reply_block = NULL;
     c->io_last_bufpos = 0;
     /* Update total number of writes on server */
     server.stat_total_writes_processed++;
-    if (getClientType(c) != CLIENT_TYPE_REPLICA) {
-        _postWriteToClient(c);
-    } else {
+
+    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
         postWriteToReplica(c);
+    } else {
+        _postWriteToClient(c);
     }
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
@@ -2923,6 +3009,45 @@ int postWriteToClient(client *c) {
             return C_ERR;
         }
     }
+
+    /* Threadsave COB drain check: detect when the RDB end marker has been
+     * fully flushed to the socket, then suspend writes until ACK.
+     * Runs after _postWriteToClient so c->bufpos==0 when fully drained. */
+    if (c->nwritten > 0 && c->repl_data && c->repl_data->using_cob) {
+        c->repl_data->tot_rdb_bytes_sent += c->nwritten;
+        bool sentRdbCOB = false;
+
+        if (c->repl_data->cob_pause_bufpos > 0 &&
+            (c->io_last_written.bufpos == c->repl_data->cob_pause_bufpos || c->bufpos == 0)) {
+            c->repl_data->cob_pause_bufpos = 0;
+            serverAssert(c->repl_data->cob_pause_objlen == 0);
+            serverAssert(c->repl_data->cob_pause_tail == NULL);
+            sentRdbCOB = true;
+        } else if (c->repl_data->cob_pause_objlen > 0 &&
+                   (((listFirst(c->reply) == c->repl_data->cob_pause_tail) &&
+                     c->io_last_written.bufpos == c->repl_data->cob_pause_objlen) ||
+                    listLength(c->reply) == 0)) {
+            serverAssert(c->repl_data->cob_pause_bufpos == 0);
+            c->repl_data->cob_pause_objlen = 0;
+            c->repl_data->cob_pause_tail = NULL;
+            sentRdbCOB = true;
+        }
+
+        if (sentRdbCOB) {
+            if (connHasWriteHandler(c->conn)) connSetWriteHandler(c->conn, NULL);
+            suspendReplicaWritesUntilAck(c);
+            serverLog(LL_NOTICE, "Halting COB writes; waiting for ACK.  Client(%llu)",
+                      (unsigned long long)c->id);
+        }
+
+        /* Switch replica to the shared replication buffer once ONLINE and COB empty. */
+        serverAssert(c->repl_data);
+        if (c->repl_data->repl_state == REPLICA_STATE_ONLINE &&
+            listLength(c->reply) == 0 && c->bufpos == 0) {
+            c->repl_data->using_cob = 0;
+        }
+    }
+
     if (c->nwritten > 0) {
         c->net_output_bytes += c->nwritten;
         /* For replicated clients we don't count sending data
@@ -2959,7 +3084,7 @@ int writeToClient(client *c) {
     c->nwritten = 0;
     c->write_flags = 0;
 
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
         writeToReplica(c);
     } else {
         _writeToClient(c);
@@ -3154,7 +3279,7 @@ int processClientIOWriteDone(client *c, int allow_async_writes) {
         return 1;
     }
 
-    if (clientHasPendingReplies(c)) {
+    if (clientHasPendingReplies(c) && !(c->repl_data && c->repl_data->stop_send_data_until_ack)) {
         if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
             /* Install the write handler if there are pending writes in some of the clients as a result of not being
              * able to write everything in one go. */
@@ -3235,6 +3360,12 @@ int handleClientsWithPendingWrites(void) {
 
         /* Try to write buffers to the client socket. */
         if (writeToClient(c) == C_ERR) continue;
+
+        /* If the client is a replica waiting for ACK, don't install write handler. */
+        if (c->flag.replica && c->repl_data && c->repl_data->stop_send_data_until_ack) {
+            serverLog(LL_NOTICE, "After write, replica is now waiting for ACK");
+            continue;
+        }
 
         /* If after the synchronous writes above we still have data to
          * output to the client, we need to install the writable handler. */
@@ -3786,6 +3917,14 @@ void commandProcessed(client *c) {
      * sub-replicas and to the replication backlog. */
     if (isReplicatedClient(c)) {
         long long applied = c->repl_data->reploff - prev_offset;
+        if ((prev_offset == 0) && server.skip_psync_offset) {
+            server.skip_psync_offset = 0;
+            applied = c->repl_data->reploff - server.primary_initial_offset;
+            size_t bytesToSkip = sdslen(c->querybuf) - (c->repl_data->read_reploff - c->repl_data->reploff) - applied;
+            if (bytesToSkip) {
+                c->repl_data->repl_applied += bytesToSkip;
+            }
+        }
         if (applied) {
             replicationFeedStreamFromPrimaryStream(c->querybuf + c->repl_data->repl_applied, applied);
             c->repl_data->repl_applied += applied;
