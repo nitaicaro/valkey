@@ -40,6 +40,7 @@
 #include "module.h"
 #include "connection.h"
 #include "zmalloc.h"
+#include "blocked_inuse.h"
 #include <strings.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
@@ -1904,6 +1905,8 @@ void unlinkClient(client *c) {
     /* If this is marked as current client unset it. */
     if (c->conn && server.current_client == c) server.current_client = NULL;
 
+    if (blockInuse_clientBlocked(c)) blockInuse_unlinkClient(c);
+
     /* Certain operations must be done only if the client has an active connection.
      * If the client was already unlinked or if it's a "fake client" the
      * conn is already set to NULL. */
@@ -1987,6 +1990,9 @@ void unlinkClient(client *c) {
 
     /* Clear the tracking status. */
     if (c->flag.tracking) disableTracking(c);
+
+    // Client should never in unblocked or blockInuse blocked state.
+    serverAssert(!(blockInuse_clientBlocked(c) || (c)->flag.unblocked));
 }
 
 /* Clear the client state to resemble a newly connected client. */
@@ -3819,6 +3825,7 @@ int processPendingCommandAndInputBuffer(client *c) {
      * But in case of a module blocked client (see RM_Call 'K' flag) we do not reach this code path.
      * So whenever we change the code here we need to consider if we need this change on module
      * blocked client as well */
+    if (c->flag.close_asap) return C_ERR;
     if (c->flag.pending_command) {
         c->flag.pending_command = 0;
         if (processCommandAndResetClient(c) == C_ERR) {
@@ -4277,7 +4284,7 @@ int isClientConnIpV6(client *c) {
  * readable format, into the sds string 's'. */
 sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (!server.crashed) waitForClientIO(client);
-    char flags[17], events[3], capa[9], conninfo[CONN_INFO_LEN], *p;
+    char flags[18], events[3], capa[9], conninfo[CONN_INFO_LEN], *p;
 
     p = flags;
     if (client->flag.replica) {
@@ -4291,6 +4298,7 @@ sds catClientInfoString(sds s, client *client, int hide_user_data) {
     if (client->flag.pubsub) *p++ = 'P';
     if (client->flag.multi) *p++ = 'x';
     if (client->flag.blocked) *p++ = 'b';
+    if (blockInuse_clientBlocked(client)) *p++ = 'X';
     if (client->flag.tracking) *p++ = 't';
     if (client->flag.tracking_broken_redir) *p++ = 'R';
     if (client->flag.tracking_bcast) *p++ = 'B';

@@ -59,11 +59,9 @@ int __wrap_processCommand(struct client *c);
 long long __wrap_aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds, aeTimeProc *proc, void *clientData, aeEventFinalizerProc *finalizerProc);
 int __wrap_ACLCheckAllUserCommandPerm(user *u, struct serverCommand *cmd, robj **argv, int argc, int dbid, int *idxptr);
 
-
-//JHB these still need refactor.  Allowing dummy functions to be mocked.
-void __wrap_amzUnblockClientsOnKey(void *info, robj *key); // temp for mock
-int __wrap_amzBlockClientOnKeys(void *info, client *c, robj **keys, int nKeys); // temp for mock
-
+robj *__wrap_lookupKeyRead(serverDb *db, robj *key);
+int __wrap_processPendingCommandAndInputBuffer(client *c);
+void __wrap_beforeNextClient(client *c);
 #undef protected
 #undef _Bool
 #undef typename
