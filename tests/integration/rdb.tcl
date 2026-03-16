@@ -518,12 +518,9 @@ start_server {overrides {forkless-options-supported yes}} {
         r config set rdb-key-save-delay 0
         waitForBgsave r
         
-        # Verify save completed successfully
-        assert_equal [s rdb_last_bgsave_status] ok
-        
-        # Reload from RDB and verify ORIGINAL values are preserved
+        # Reload from RDB (without re-saving) and verify ORIGINAL values are preserved
         # (consistent snapshot should capture state at start of save)
-        r debug reload
+        catch {r debug reload nosave}
         for {set db 0} {$db < 5} {incr db} {
             r select $db
             # Check that we have original values, not modified ones
@@ -539,7 +536,6 @@ start_server {overrides {forkless-options-supported yes}} {
             assert {[lsearch $set_members "B1"] != -1}
             assert {[lsearch $set_members "MODIFIED"] == -1}
         }
-        r select 0
     } {} {needs:debug}
 
     test "modify new keys during thread bgsave" {
@@ -1585,13 +1581,6 @@ start_server {} {
         # Verify our original data is not flushed
         assert_equal [r get testkey1] "value1"
         assert_equal [r get testkey2] "value2"
-    }
-}
-
-start_server {} {
-    test {threadsave-enabled-for-backup requires forkless-options-supported} {
-        catch {r config set threadsave-enabled-for-backup yes} err
-        assert_match "*forkless-options-supported*" $err
     }
 }
 

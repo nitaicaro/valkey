@@ -6,6 +6,7 @@
 #include "monotonic.h"
 #include "mutexqueue.h"
 #include "server.h"
+#include "blocked_inuse.h"
 
 int getFlushCommandFlags(client *c, int *flags);    // in db.c
 uint64_t dictObjHash(const void *key);                                      // in server.c
@@ -33,9 +34,6 @@ static bool ignoreKeyForSave(sds key) {
     UNUSED(key);
     return false;
 }
-
-void amzUnblockClientsOnKey(void *info, robj *key); // temp for mock
-int amzBlockClientOnKeys(void *info, client *c, robj *keys[], int nKeys); // temp for mock
 
 //------- END OF COMPILE HACKS -------------------
 
@@ -1465,7 +1463,7 @@ static void processReturnOfItemToValkey(bgIteratorItem *item, bgIterator *iter) 
                         //  happen only rarely, and with minimal impact.)
                         robj key;
                         initStaticStringObject(key, objectGetKey(item->u.dbe.de));
-                        amzUnblockClientsOnKey(NULL, &key);
+                        blockInuse_unblockClientsOnKey(&key);
                     }
                     // resumeRehashing must be called before decrementEntryInuse, since decrementEntryInuse can free
                     if (item->u.dbe.is_rehashing_paused) resumeRehashing(item->u.dbe.de);
@@ -2404,13 +2402,6 @@ bool bgIteration_blockClientIfRequired(client *c) {
 
     if (c->cmd->proc == execCommand) {
         mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
-        // JHB - HACK because no blocking yet
-        while (mustBlock) {
-            receiveItemsBackFromIterators(true);    // Blocking
-            dictEmpty(waitOnKeys, NULL);
-            mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
-        }
-        // JHB - END HACK
     } else {
         getKeysResult result;
         initGetKeysResult(&result);
@@ -2421,14 +2412,13 @@ bool bgIteration_blockClientIfRequired(client *c) {
                             c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
             serverAssert(!(mustBlock && (c->flag.multi) && !(c->flag.script)));
 
-            //if (mustBlock && (c->flag.script)) {
-            if (mustBlock) { // JHB HACK - do this for everything because of missing blocking
+            if (mustBlock && (c->flag.script)) {
                 /* For scripts, we will block for keys declared in EVAL/EVALSHA/FCALL.
-                 *  However, scripts are NOT required to declare keys.  Even if it declares keys,
-                 *  it's not declaring the DB for the key.  After a SELECT or SWAPDB, we might be on
-                 *  a key we haven't blocked for.  In this case, there is no option but to execute a
-                 *  synchronous block and wait for the iterator(s) to be done with the key(s).
-                 *  (Yuck.)  */
+                *  However, scripts are NOT required to declare keys.  Even if it declares keys,
+                *  it's not declaring the DB for the key.  After a SELECT or SWAPDB, we might be on
+                *  a key we haven't blocked for.  In this case, there is no option but to execute a
+                *  synchronous block and wait for the iterator(s) to be done with the key(s).
+                *  (Yuck.)  */
                 while (mustBlock) {
                     receiveItemsBackFromIterators(true);    // Blocking
                     dictEmpty(waitOnKeys, NULL);
@@ -2462,8 +2452,7 @@ bool bgIteration_blockClientIfRequired(client *c) {
         dictReleaseIterator(di);
         serverAssert(argvCount == dictSize(waitOnKeys));
 
-        int rc = amzBlockClientOnKeys(NULL, c, waitKeysArgv, argvCount);
-        serverAssert(rc == C_OK);
+        blockInuse_blockClientOnKeys(c, argvCount, waitKeysArgv);
 
         zfree(waitKeysArgv);
     }

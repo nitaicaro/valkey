@@ -363,6 +363,7 @@ static void dbSetValue(serverDb *db, robj *key, robj **valref, int overwrite, vo
         val->lru = old->lru;
         long long expire = objectGetExpire(old);
         new = objectSetKeyAndExpire(val, objectGetVal(key), expire);
+        bgIteration_updateDbEntryPtr(old, new);
         *oldref = new;
         /* Replace the old value at its location in the expire space. */
         if (expire >= 0) {
