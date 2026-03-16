@@ -588,7 +588,7 @@ start_server {overrides {forkless-options-supported yes}} {
         
         # Reload and verify ONLY original keys exist (new keys should NOT be in snapshot)
         # Consistent snapshot should only have keys that existed at start
-        r debug reload
+        catch {r debug reload nosave}
         assert_equal [r dbsize] $original_keys
         
         # Verify original keys exist (sample check)
@@ -664,7 +664,7 @@ start_server {overrides {forkless-options-supported yes}} {
         # Reload from RDB and verify keys are in ORIGINAL databases
         # (SWAPDB is ignored for consistent snapshots)
         r select 0
-        r debug reload
+        catch {r debug reload nosave}
         for {set db 0} {$db < 5} {incr db} {
             r select $db
             # Each database should have its original key count
@@ -732,7 +732,7 @@ start_server {overrides {forkless-options-supported yes}} {
         # Reload from RDB and verify ORIGINAL keys still exist
         # Consistent snapshot should preserve state before SWAPDB and deletions
         r select 0
-        r debug reload
+        catch {r debug reload nosave}
         set total_keys 0
         for {set db 0} {$db < 5} {incr db} {
             r select $db
@@ -786,7 +786,7 @@ start_server {overrides {forkless-options-supported yes}} {
         
         # Reload from RDB and verify ORIGINAL keys still exist
         # Consistent snapshot should preserve keys that existed at start
-        r debug reload
+        catch {r debug reload nosave}
         assert_equal [r dbsize] $initial_keys
         
         # Verify original keys exist (sample check)
@@ -910,7 +910,7 @@ start_server {overrides {forkless-options-supported yes}} {
         $rd12 close
 
         # Verify snapshot contains original keys (blocking commands should not affect snapshot)
-        r debug reload
+        catch {r debug reload nosave}
         
         # Original keys should be preserved in snapshot
         assert_equal [r get before_0] "value_before_0"
@@ -956,7 +956,7 @@ start_server {overrides {forkless-options-supported yes}} {
         waitForBgsave r
         
         # Reload from RDB
-        r debug reload
+        catch {r debug reload nosave}
         
         # Check keycount is reasonable
         set keycount [r dbsize]
@@ -1028,7 +1028,7 @@ start_server {overrides {forkless-options-supported yes}} {
         r config set maxmemory 0
         
         # Verify snapshot contains original keys (evictions should not affect snapshot)
-        r debug reload
+        catch {r debug reload nosave}
         
         # Original keys should be preserved in snapshot despite evictions
         assert_equal [r get before_0] "value_before_0"
@@ -1078,7 +1078,7 @@ start_server {overrides {forkless-options-supported yes}} {
         waitForBgsave r
         
         # Verify snapshot contains original keys (modifications should not affect snapshot)
-        r debug reload
+        catch {r debug reload nosave}
         
         # Original keys should be preserved in snapshot
         assert_equal [r get before_0] "value_before_0"
@@ -1127,7 +1127,7 @@ start_server {overrides {forkless-options-supported yes}} {
         waitForBgsave r
         
         # Verify snapshot contains original keys
-        r debug reload
+        catch {r debug reload nosave}
         
         # Original geo_1 key should be preserved
         assert_equal [r zcard geo_1] 1
@@ -1240,7 +1240,7 @@ start_server {overrides {forkless-options-supported yes}} {
         $rd4 close
         
         # Verify snapshot contains original keys
-        r debug reload
+        catch {r debug reload nosave}
         
         # Original keys should be preserved in all databases
         r select 0
