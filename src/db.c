@@ -433,8 +433,6 @@ void setKey(client *c, serverDb *db, robj *key, robj **valref, int flags) {
     } else {
         dbSetValue(db, key, valref, 1, NULL);
     }
-    bgIterationEntryMetadata *md = (bgIterationEntryMetadata *)objectGetMetadata(*valref);
-    if (md) md->iterator_epoch = bgIteration_getEpoch();
     if (!(flags & SETKEY_KEEPTTL)) removeExpire(db, key);
     if (!(flags & SETKEY_NO_SIGNAL)) signalModifiedKey(c, db, key);
 }
@@ -759,6 +757,16 @@ long long dbTotalServerKeyCount(void) {
  * a context of a client. */
 void signalModifiedKey(client *c, serverDb *db, robj *key) {
     touchWatchedKey(db, key);
+    /* Update bgiterator's epoch and slot integrity's mutation count
+     * only when bgiterator or SM are running
+     * (we simplify the check of SM by checking if it's a CME). */
+    if (server.cluster_enabled || bgIteration_iterationActive()) {
+        robj *o = dbFind(db, objectGetVal(key));
+        if (o) {
+            bgIterationEntryMetadata *md = (bgIterationEntryMetadata *)objectGetMetadata(o);
+            if (md) md->iterator_epoch = bgIteration_getEpoch();
+        }
+    }
     trackingInvalidateKey(c, key, 1);
 }
 

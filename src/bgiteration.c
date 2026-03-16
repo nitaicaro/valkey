@@ -2087,8 +2087,7 @@ static bgIterator * bgIteratorCreate(
     it->item_count_target = last_item_count_target;
     it->iteration_flags = flags;
     it->iteration_type = iter_type;
-    // it->consistent_modification_id = bgIteration_epoch++;
-    it->consistent_modification_id = 0;  // TEMP: hardcode to 0 for testing
+    it->consistent_modification_id = bgIteration_epoch++;
     it->keyset_iter = keyset_iter;
     it->early_iterate_entries = dictCreate(&dictEntryPtrDictType);
     dictExpand(it->early_iterate_entries, BGITER_EARLY_ITERATE_DICT_INITIAL_SIZE);

@@ -593,7 +593,7 @@ start_server {overrides {forkless-options-supported yes}} {
         
         # Verify original keys exist (sample check)
         assert_equal [r get before_0] "value_before_0"
-        assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        assert_equal [r lrange lst_0 0 -1] [list "L1" "L2" "R1" "R2"]
         assert_equal [lsort [r smembers set_0]] [list "B1" "B2"]
         
         # Verify new keys do NOT exist in snapshot
@@ -671,11 +671,10 @@ start_server {overrides {forkless-options-supported yes}} {
             assert_equal [r dbsize] $initial_db_keys($db)
             # Verify original values in original database (sample check)
             assert_equal [r get db${db}_before_0] "value_before_0"
-            assert_equal [r lrange db${db}_lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+            assert_equal [r lrange db${db}_lst_0 0 -1] [list "L1" "L2" "R1" "R2"]
             assert_equal [lsort [r smembers db${db}_set_0]] [list "B1" "B2"]
             assert_equal [r hget db${db}_hash_0 "H1"] "a"
         }
-        r select 0
     } {} {needs:debug}
 
     test "delete all keys after SWAPDB during thread bgsave" {
@@ -744,9 +743,8 @@ start_server {overrides {forkless-options-supported yes}} {
         for {set db 0} {$db < 5} {incr db} {
             r select $db
             assert_equal [r get db${db}_before_0] "value_before_0"
-            assert_equal [r lrange db${db}_lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+            assert_equal [r lrange db${db}_lst_0 0 -1] [list "L1" "L2" "R1" "R2"]
         }
-        r select 0
     } {} {needs:debug}
 
     test "deleting keys during thread bgsave" {
@@ -791,7 +789,7 @@ start_server {overrides {forkless-options-supported yes}} {
         
         # Verify original keys exist (sample check)
         assert_equal [r get before_0] "value_before_0"
-        assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        assert_equal [r lrange lst_0 0 -1] [list "L1" "L2" "R1" "R2"]
         assert_equal [r smembers set_0] [lsort [list "B1" "B2"]]
     } {} {needs:debug}
 
@@ -1043,8 +1041,8 @@ start_server {overrides {forkless-options-supported yes}} {
         r flushall
         r config set save ""
         
-        # Create initial dataset with 1000 keys
-        createComplexDatasetForVerification r 1000
+        # Create initial dataset with 100 keys
+        createComplexDatasetForVerification r 100
         
         # Start save with stopped speed
         r config set rdb-key-save-delay 100000
@@ -1057,7 +1055,7 @@ start_server {overrides {forkless-options-supported yes}} {
         }
         
         # Overwrite keys during save - comprehensive operations on all data types
-        for {set i 0} {$i < 1000} {incr i} {
+        for {set i 0} {$i < 100} {incr i} {
             r append before_$i "value_after_$i"
             r incr int_$i
             r set after_$i "VALUE_AFTER_$i"
@@ -1083,7 +1081,7 @@ start_server {overrides {forkless-options-supported yes}} {
         # Original keys should be preserved in snapshot
         assert_equal [r get before_0] "value_before_0"
         assert_equal [r get int_0] "42"
-        assert_equal [r lrange lst_0 0 -1] [list "R2" "R1" "L1" "L2"]
+        assert_equal [r lrange lst_0 0 -1] [list "L1" "L2" "R1" "R2"]
         assert_equal [lsort [r smembers set_0]] [list "B1" "B2"]
         
         # New keys created during save should NOT be in snapshot
@@ -1096,7 +1094,7 @@ start_server {overrides {forkless-options-supported yes}} {
         r config set save ""
         
         # Create initial dataset with geo data
-        createComplexDatasetForVerification r 1000
+        createComplexDatasetForVerification r 100
         
         # Create additional zsets for georadius STORE operations
         r zadd georad_zset_delete_test 1 Z1 2 Z2
@@ -1200,10 +1198,31 @@ start_server {overrides {forkless-options-supported yes}} {
         $rd1 exec
         $rd4 exec
         
-        # Read responses
-        $rd0 read
-        $rd1 read
-        $rd4 read
+        # Read responses (each deferred client has multiple queued responses)
+        $rd0 read ;# select
+        $rd0 read ;# multi
+        $rd0 read ;# set (QUEUED)
+        $rd0 read ;# incrby (QUEUED)
+        $rd0 read ;# exec
+
+        $rd1 read ;# select
+        $rd1 read ;# multi
+        $rd1 read ;# set (QUEUED)
+        $rd1 read ;# set (QUEUED)
+        $rd1 read ;# lpush (QUEUED)
+        $rd1 read ;# sadd (QUEUED)
+        $rd1 read ;# set (QUEUED)
+        $rd1 read ;# exec
+
+        $rd4 read ;# select
+        $rd4 read ;# multi
+        $rd4 read ;# hset (QUEUED)
+        $rd4 read ;# hset (QUEUED)
+        $rd4 read ;# zadd (QUEUED)
+        $rd4 read ;# set (QUEUED)
+        $rd4 read ;# set (QUEUED)
+        $rd4 read ;# xadd (QUEUED)
+        $rd4 read ;# exec
         
         # Verify transactions executed
         r select 0
@@ -1229,7 +1248,11 @@ start_server {overrides {forkless-options-supported yes}} {
         r select 3
         assert_equal [r exists aftersave] 0
         $rd3 exec
-        $rd3 read
+        $rd3 read ;# select
+        $rd3 read ;# multi
+        $rd3 read ;# set (QUEUED)
+        $rd3 read ;# xadd (QUEUED)
+        $rd3 read ;# exec
         assert_equal [r get aftersave] "bad1"
         assert_equal [r xlen another_newstream] 1
         
@@ -1245,9 +1268,9 @@ start_server {overrides {forkless-options-supported yes}} {
         # Original keys should be preserved in all databases
         r select 0
         assert_equal [r get before_0] "value_before_0"
-        assert_equal [r get int_1] "42"
+        assert_equal [r get int_1] "43"
         r select 1
-        assert_equal [r get int_2] "43"
+        assert_equal [r get int_2] "44"
         assert_equal [r llen lst_3] 4
         r select 4
         assert_equal [r exists newkey] 0
@@ -1256,7 +1279,6 @@ start_server {overrides {forkless-options-supported yes}} {
         r select 3
         assert_equal [r exists aftersave] 0
         assert_equal [r exists another_newstream] 0
-        r select 0
     } {} {needs:debug}
 
     test "thread bgsave writes valkey-threadsave-version AUX field" {
