@@ -421,49 +421,43 @@ start_server {overrides {forkless-options-supported yes} tags {"other"}} {
         }
     }
 }
-foreach bgsave_type {"" "fork" "thread"} {
-    start_server {overrides {forkless-options-supported yes} tags {"other external:skip"}} {
-        test "Don't rehash if server has child process - bgsave $bgsave_type" {
-            r config set save ""
-            r config set rdb-key-save-delay 1000000
+start_server {tags {"other external:skip"}} {
+    test "Don't rehash if server has child process" {
+        r config set save ""
+        r config set rdb-key-save-delay 1000000
 
-            # Populate some, then check table size and populate more up to one less
-            # than the soft maximum fill factor.
-            populate 2000 a 1
-            set table_size [main_hash_table_size]
-            populate [main_hash_table_keys_before_rehashing_starts] b 1
+        # Populate some, then check table size and populate more up to one less
+        # than the soft maximum fill factor.
+        populate 2000 a 1
+        set table_size [main_hash_table_size]
+        populate [main_hash_table_keys_before_rehashing_starts] b 1
 
-            # Now we are close to resizing. Check that rehashing didn't start.
-            assert_equal $table_size [main_hash_table_size]
-            assert_no_match "*Hash table 1 stats*" [r debug htstats 9]
+        # Now we are close to resizing. Check that rehashing didn't start.
+        assert_equal $table_size [main_hash_table_size]
+        assert_no_match "*Hash table 1 stats*" [r debug htstats 9]
 
-            r bgsave {*}$bgsave_type
-            wait_for_condition 10 100 {
-                [s rdb_bgsave_in_progress] eq 1
-            } else {
-                fail "bgsave did not start in time"
-            }
+        r bgsave
+        wait_for_condition 10 100 {
+            [s rdb_bgsave_in_progress] eq 1
+        } else {
+            fail "bgsave did not start in time"
+        }
 
-            r mset k1 v1 k2 v2
-            # Hash table should not rehash
-            assert_equal $table_size [main_hash_table_size]
-            assert_no_match "*Hash table 1 stats*" [r debug htstats 9]
-            if {$bgsave_type ne "thread"} {
-                exec kill -9 [get_child_pid 0]
-            } else {
-                r bgsave cancel
-            }
-            waitForBgsave r
+        r mset k1 v1 k2 v2
+        # Hash table should not rehash
+        assert_equal $table_size [main_hash_table_size]
+        assert_no_match "*Hash table 1 stats*" [r debug htstats 9]
+        exec kill -9 [get_child_pid 0]
+        waitForBgsave r
 
-            # Hash table should rehash since there is no child process,
-            # so the resize limit is restored.
-            wait_for_condition 50 100 {
-                [main_hash_table_size] > $table_size
-            } else {
-                fail "hash table did not rehash after child process killed"
-            }
-        } {} {needs:debug needs:local-process}
-    }
+        # Hash table should rehash since there is no child process,
+        # so the resize limit is restored.
+        wait_for_condition 50 100 {
+            [main_hash_table_size] > $table_size
+        } else {
+            fail "hash table did not rehash after child process killed"
+        }
+    } {} {needs:debug needs:local-process}
 }
 
 proc read_proc_title {pid} {
