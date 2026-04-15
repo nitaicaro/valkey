@@ -737,7 +737,7 @@ static void unblockClientOnKey(client *c, robj *key) {
         server.current_client = c;
         enterExecutionUnit(1, 0);
         processCommandAndResetClient(c);
-        if (!c->flag.blocked) {
+        if (!c->flag.blocked && !blockInuse_clientBlocked(c)) {
             if (c->flag.module) {
                 moduleCallCommandUnblockedHandler(c);
             } else {
