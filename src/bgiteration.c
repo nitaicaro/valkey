@@ -2257,11 +2257,6 @@ bgIteratorItem * bgIteratorRead(bgIterator *it) {
     // First, clean up the previous item read
     if (it->current_item != NULL) {
         returnCurrentItemToValkey(it);
-
-        // To support unit tests.  Normal clients call bgIteratorRead from an alternate thread.
-        //  Without this, a unit test could get stuck waiting on the completion event because
-        //  feed won't get invoked.  For production, this is called regularly from the main thread.
-        if (onValkeyMainThread()) bgIteration_feedIterators_task(NULL, 0, NULL);
     } else {
         it->client_is_active = true;
     }
