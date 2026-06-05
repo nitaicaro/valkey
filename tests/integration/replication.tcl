@@ -327,11 +327,13 @@ start_server {tags {"repl external:skip"}} {
 
 foreach mdl {no yes} dualchannel {no yes} {
     foreach sdl {disabled swapdb} {
-        start_server {tags {"repl external:skip"} overrides {save {}}} {
+        foreach threadsave {no yes} {
+        start_server {tags {"repl external:skip"} overrides {save {} forkless-options-supported yes}} {
             set master [srv 0 client]
             $master config set repl-diskless-sync $mdl
             $master config set repl-diskless-sync-delay 5
             $master config set repl-diskless-sync-max-replicas 3
+            $master config set threadsave-enabled-for-replication $threadsave
             set master_host [srv 0 host]
             set master_port [srv 0 port]
             set slaves {}
@@ -341,7 +343,7 @@ foreach mdl {no yes} dualchannel {no yes} {
                     lappend slaves [srv 0 client]
                     start_server {overrides {save {}}} {
                         lappend slaves [srv 0 client]
-                        test "Connect multiple replicas at the same time (issue #141), master diskless=$mdl, replica diskless=$sdl dual-channel-replication-enabled=$dualchannel" {
+                        test "Connect multiple replicas at the same time (issue #141), master diskless=$mdl, replica diskless=$sdl dual-channel-replication-enabled=$dualchannel threadsave=$threadsave" {
                             # start load handles only inside the test, so that the test can be skipped
                             set load_handle0 [start_bg_complex_data $master_host $master_port 9 100000000]
                             set load_handle1 [start_bg_complex_data $master_host $master_port 11 100000000]
@@ -419,6 +421,7 @@ foreach mdl {no yes} dualchannel {no yes} {
                 }
             }
         }
+        }
     }
 }
 
@@ -467,7 +470,8 @@ start_server {tags {"repl external:skip"} overrides {save {}}} {
 
 # Diskless load swapdb when NOT async_loading (different master replid)
 foreach testType {Successful Aborted} dualchannel {yes no} {
-    start_server {tags {"repl external:skip"}} {
+    foreach threadsave {no yes} {
+    start_server {tags {"repl external:skip"} overrides {forkless-options-supported yes}} {
         set replica [srv 0 client]
         set replica_host [srv 0 host]
         set replica_port [srv 0 port]
@@ -482,6 +486,7 @@ foreach testType {Successful Aborted} dualchannel {yes no} {
             $master config set repl-diskless-sync-delay 0
             $master config set save ""
             $master config set dual-channel-replication-enabled $dualchannel
+            $master config set threadsave-enabled-for-replication $threadsave
             $replica config set repl-diskless-load swapdb
             $replica config set save ""
             $replica config set dual-channel-replication-enabled $dualchannel
@@ -504,7 +509,7 @@ foreach testType {Successful Aborted} dualchannel {yes no} {
                     # Start the replication process
                     $replica replicaof $master_host $master_port
 
-                    test "Diskless load swapdb (different replid): replica enter loading dual-channel-replication-enabled=$dualchannel" {
+                    test "Diskless load swapdb (different replid): replica enter loading dual-channel-replication-enabled=$dualchannel threadsave=$threadsave" {
                         # Wait for the replica to start reading the rdb
                         wait_for_condition 100 100 {
                             [s -1 loading] eq 1
@@ -528,7 +533,7 @@ foreach testType {Successful Aborted} dualchannel {yes no} {
                         fail "Replica didn't disconnect"
                     }
 
-                    test "Diskless load swapdb (different replid): old database is exposed after replication fails dual-channel=$dualchannel" {
+                    test "Diskless load swapdb (different replid): old database is exposed after replication fails dual-channel=$dualchannel threadsave=$threadsave" {
                         # Ensure we see old values from replica
                         assert_equal [$replica get mykey] "myvalue"
 
@@ -550,7 +555,7 @@ foreach testType {Successful Aborted} dualchannel {yes no} {
                         fail "Master <-> Replica didn't finish sync"
                     }
 
-                    test "Diskless load swapdb (different replid): new database is exposed after swapping dual-channel=$dualchannel" {
+                    test "Diskless load swapdb (different replid): new database is exposed after swapping dual-channel=$dualchannel threadsave=$threadsave" {
                         # Ensure we don't see anymore the key that was stored only to replica and also that we don't get LOADING status
                         assert_equal [$replica GET mykey] ""
 
@@ -561,11 +566,13 @@ foreach testType {Successful Aborted} dualchannel {yes no} {
             }
         }
     }
+    }
 }
 
 # Diskless load swapdb when async_loading (matching master replid)
+foreach threadsave {no yes} {
 foreach testType {Successful Aborted} {
-    start_server {tags {"repl external:skip"}} {
+    start_server {tags {"repl external:skip"} overrides {forkless-options-supported yes}} {
         set replica [srv 0 client]
         set replica_host [srv 0 host]
         set replica_port [srv 0 port]
@@ -579,6 +586,7 @@ foreach testType {Successful Aborted} {
             $master config set repl-diskless-sync yes
             $master config set repl-diskless-sync-delay 0
             $master config set save ""
+            $master config set threadsave-enabled-for-replication $threadsave
             $replica config set repl-diskless-load swapdb
             $replica config set save ""
             $replica config set dual-channel-replication-enabled no; # Doesn't work with swapdb
@@ -645,7 +653,7 @@ foreach testType {Successful Aborted} {
 
             switch $testType {
                 "Aborted" {
-                    test {Diskless load swapdb (async_loading): replica enter async_loading} {
+                    test "Diskless load swapdb (async_loading): replica enter async_loading threadsave=$threadsave" {
                         # Wait for the replica to start reading the rdb
                         wait_for_condition 100 100 {
                             [s -1 async_loading] eq 1
@@ -656,7 +664,7 @@ foreach testType {Successful Aborted} {
                         assert_equal [s -1 loading] 0
                     }
 
-                    test {Diskless load swapdb (async_loading): old database is exposed while async replication is in progress} {
+                    test "Diskless load swapdb (async_loading): old database is exposed while async replication is in progress threadsave=$threadsave" {
                         # Ensure we still see old values while async_loading is in progress and also not LOADING status
                         assert_equal [$replica get mykey] "myvalue"
 
@@ -700,7 +708,7 @@ foreach testType {Successful Aborted} {
                         fail "Replica didn't disconnect"
                     }
 
-                    test {Diskless load swapdb (async_loading): old database is exposed after async replication fails} {
+                    test "Diskless load swapdb (async_loading): old database is exposed after async replication fails threadsave=$threadsave" {
                         # Ensure we see old values from replica
                         assert_equal [$replica get mykey] "myvalue"
 
@@ -722,7 +730,7 @@ foreach testType {Successful Aborted} {
                         fail "Master <-> Replica didn't finish sync"
                     }
 
-                    test {Diskless load swapdb (async_loading): new database is exposed after swapping} {
+                    test "Diskless load swapdb (async_loading): new database is exposed after swapping threadsave=$threadsave" {
                         # Ensure we don't see anymore the key that was stored only to replica and also that we don't get LOADING status
                         assert_equal [$replica GET mykey] ""
 
@@ -846,6 +854,7 @@ test {diskless loading short read} {
         }
     }
 } {} {external:skip}
+}
 
 # get current stime and utime metrics for a thread (since it's creation)
 proc get_cpu_metrics { statfile } {
