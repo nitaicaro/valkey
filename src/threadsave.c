@@ -329,11 +329,10 @@ static void freeRecentlyTerminatedClients(threadsaveInfo *saveInfo) {
     listRewind(saveInfo->u.repl.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-        if (c->flag.close_asap || c->flag.close_after_reply) {
+        if (c->flag.threadsave_close_asap || c->flag.close_after_reply) {
             listDelNode(saveInfo->u.repl.clients, ln);
-            c->flag.threadsave_managed = 0;
-            if (c->repl_data) c->repl_data->using_cob = 0;
-            freeClient(c);
+            /* Push to foreground_queue so the timer proc frees it properly */
+            mutexQueueAdd(saveInfo->foreground_queue, c);
         }
     }
 }
@@ -348,8 +347,14 @@ static void abandonClient(threadsaveInfo *saveInfo, client *c) {
     listDelNode(saveInfo->u.repl.clients, ln);
 
     int remaining = listLength(saveInfo->u.repl.clients);
-    serverLog(LL_WARNING, "threadsave: client(%llu) unresponsive.  %d clients remain.",
-            (unsigned long long)c->id, remaining);
+
+    if (c->flag.threadsave_close_asap) {
+        serverLog(LL_WARNING, "threadsave: client(%llu) closed by valkey.  %d clients remain.",
+                (unsigned long long)c->id, remaining);
+    } else {
+        serverLog(LL_WARNING, "threadsave: client(%llu) unresponsive.  %d clients remain.",
+                (unsigned long long)c->id, remaining);
+    }
 
     // If the client connection is part of a connection set, remove it
     if (rioCheckType(&saveInfo->save_rio) == RIO_TYPE_CONNSET) {
@@ -361,8 +366,6 @@ static void abandonClient(threadsaveInfo *saveInfo, client *c) {
         serverLog(LL_WARNING, "threadsave: error returning client(%llu) to non-blocking.", (unsigned long long)c->id);
     }
 
-    c->flag.threadsave_managed = 0;
-    if (c->repl_data) c->repl_data->using_cob = 0;
     mutexQueueAdd(saveInfo->foreground_queue, c);
 }
 
@@ -375,7 +378,11 @@ static int pruneDisconnectedReplicas(threadsaveInfo *saveInfo) {
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
         waitForClientIO(c);
-        // Check if client should be abandoned (simplified - no ElastiCache flags)
+        if (c->flag.threadsave_close_asap) {
+            serverLog(LL_DEBUG, "threadsave: detected threadsave_close_asap on client(%llu).",
+                    (unsigned long long)c->id);
+            abandonClient(saveInfo, c);
+        }
     }
     return listLength(saveInfo->u.repl.clients);
 }
@@ -894,9 +901,12 @@ static long long replicationMonitorTimeProc(struct aeEventLoop *eventLoop, long 
         client *c = item;
         serverLog(LL_WARNING, "threadsave: client(%llu) ended replication early",
                   (unsigned long long)c->id);
+        c->flag.threadsave_close_asap = 0;
         c->flag.threadsave_managed = 0;
-        if (c->repl_data) c->repl_data->using_cob = 0;
-        if (c->repl_data) c->repl_data->repl_state = REPL_STATE_NONE;
+        if (c->repl_data) {
+            c->repl_data->using_cob = 0;
+            c->repl_data->repl_state = REPL_STATE_NONE;
+        }
         freeClient(c);
     }
     return REPLICATION_MONITOR_INTERVAL_MS;
