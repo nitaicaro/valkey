@@ -1916,7 +1916,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
             return C_ERR;
         }
         serverLog(LL_NOTICE, "Background saving started by pid %ld", (long)childpid);
-        rdbRecordStartMetrics(RDB_BGSAVE_TYPE_FORK);
+        rdbRecordStartMetrics(RDB_BGSAVE_TYPE_FORK, RDB_WRITE_TARGET_DISK);
         return C_OK;
     }
     return C_OK; /* unreached */
@@ -4763,11 +4763,11 @@ int rdbWriteFooter(rio *rdb, int req) {
 }
 
 /* Common state updates when a background save starts. */
-void rdbRecordStartMetrics(int bgsave_type) {
+void rdbRecordStartMetrics(int bgsave_type, int write_target) {
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
     server.rdb_save_time_start = time(NULL);
-    server.rdb_write_target = RDB_WRITE_TARGET_DISK;
+    server.rdb_write_target = write_target;
     server.cur_bgsave_type = bgsave_type;
 }
 
