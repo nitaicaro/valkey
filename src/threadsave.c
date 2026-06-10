@@ -780,7 +780,7 @@ static int threadsaveCommonStart(threadsaveInfo *saveInfo) {
     saveInfo->cur_db = -1;
 
     serverLog(LL_NOTICE, "Using Threadsave for next backup");
-    rdbRecordStartMetrics(RDB_BGSAVE_TYPE_THREAD);
+    rdbRecordStartMetrics(RDB_BGSAVE_TYPE_THREAD, saveInfo->write_target);
     startSaving(RDBFLAGS_THREADSAVE);
 
     rdbSaveInfo rsi, *rsiptr = rdbPopulateSaveInfo(&rsi);
@@ -981,6 +981,15 @@ int threadsaveToSockets(void) {
      * switches the connections to blocking mode, and begins writing directly to the
      * sockets — blocking is acceptable since it's no longer on the main thread. */
     rioInitWithReplicaCOB(&saveInfo->save_rio);
+
+    /* Write diskless sync framing before the RDB header.
+     * The replica expects: $EOF:<40-byte-marker>\r\n<RDB data><marker>\r\n */
+    if (rioWrite(&saveInfo->save_rio, "$EOF:", 5) == 0
+     || rioWrite(&saveInfo->save_rio, saveInfo->u.repl.eofmark, RDB_EOF_MARK_SIZE) == 0
+     || rioWrite(&saveInfo->save_rio, "\r\n", 2) == 0) {
+        serverLog(LL_WARNING, "threadsave: error writing EOF start marker");
+        goto werr;
+    }
 
     int rc = threadsaveCommonStart(saveInfo);
     if (rc != C_OK) goto werr;
