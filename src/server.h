@@ -1151,6 +1151,7 @@ typedef struct ClientFlags {
     uint64_t asking : 1;                   /* Client issued the ASKING command */
     uint64_t close_asap : 1;               /* Close this client ASAP */
     uint64_t threadsave_managed : 1;       /* Client is owned by threadsave, don't free */
+    uint64_t threadsave_close_asap : 1;   /* Let threadsave thread know to close client */
     uint64_t unix_socket : 1;              /* Client connected via Unix domain socket */
     uint64_t dirty_exec : 1;               /* EXEC will fail for errors while queueing */
     uint64_t primary_force_reply : 1;      /* Queue replies even if is primary */

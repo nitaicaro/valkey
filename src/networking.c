@@ -2074,7 +2074,7 @@ void freeClient(client *c) {
 
     /* If threadsave owns this client, don't free it — threadsave will handle it. */
     if (c->flag.threadsave_managed) {
-        if (c->flag.close_asap) return; /* Already marked, don't double-process. */
+        if (c->flag.threadsave_close_asap) return; /* Already marked, don't double-process. */
 
         serverLog(LL_NOTICE,
                   "freeClient: master trying to free client(%llu) owned by threadsave",
@@ -2095,7 +2095,7 @@ void freeClient(client *c) {
 
         freeReplicaReferencedReplBuffer(c);
 
-        c->flag.close_asap = 1;
+        c->flag.threadsave_close_asap = 1;
         return;
     }
 
