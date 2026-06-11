@@ -1027,7 +1027,7 @@ int threadsaveToSockets(void) {
     /* Create iterator with REPLICATION flag (no consistent snapshot needed).
      * threadsaveReplDone is called on the main thread when iteration finishes. */
     saveInfo->iterator = bgIteratorCreateFullScanIter(THREADSAVE_SOCKET_ITER_NAME,
-            BGITERATOR_FLAG_REPLICATION, threadsaveReplDone, threadsaveComplete, saveInfo);
+            BGITERATOR_CONSISTENCY_EVENTUAL, threadsaveReplDone, threadsaveComplete, saveInfo);
     if (saveInfo->iterator == NULL) {
         serverLog(LL_WARNING, "threadsave: error creating iterator");
         goto werr;
