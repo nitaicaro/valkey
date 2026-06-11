@@ -328,6 +328,11 @@ int canFeedReplicaReplBuffer(client *replica) {
     /* Don't feed replicas that are still waiting for BGSAVE to start. */
     if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_START) return 0;
 
+    /* Don't feed replicas that are syncing via threadsave-to-socket. Replication
+     * data is inlined into the RDB stream by the iterator, so the shared replication
+     * buffer is not needed for these clients. */
+    if (replica->flag.threadsave_managed && isThreadsaveToSocketActive()) return 0;
+
     return 1;
 }
 
