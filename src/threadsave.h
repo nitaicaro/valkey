@@ -12,5 +12,6 @@ int threadsaveToSockets(void);
 void threadsaveCancel(void);
 bool isThreadsaveActive(void);
 bool isThreadsaveToSocketActive(void);
+int threadsaveActiveClientCount(void);
 
 #endif

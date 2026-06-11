@@ -43,6 +43,11 @@ bool isThreadsaveToSocketActive(void) {
     return currentThreadsave != NULL && currentThreadsave->write_target == RDB_WRITE_TARGET_SOCKET;
 }
 
+int threadsaveActiveClientCount(void) {
+    if (!isThreadsaveToSocketActive()) return 0;
+    return (int)listLength(currentThreadsave->u.repl.clients);
+}
+
 /* When saving a large object, there is no mechanism to break out and perform periodic status
  * checks. To get around this, the rioWrite routine is replaced with this function. The original
  * write routine is saved in the threadsaveInfo. */

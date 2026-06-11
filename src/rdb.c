@@ -1432,8 +1432,8 @@ ssize_t rdbSaveDb(rio *rdb, int dbid, int rdbflags, int rdbver, long *key_counte
         /* In fork child process, we can try to release memory back to the
          * OS and possibly avoid or decrease COW. We give the dismiss
          * mechanism a hint about an estimated size of the object we stored. */
-        size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
-        if (server.in_fork_child) dismissObject(o, dump_size);
+        // size_t dump_size = rdb->processed_bytes - rdb_bytes_before_key;
+        // if (server.in_fork_child) dismissObject(o, dump_size);
 
         /* Update child info every 1 second (approximately).
          * in order to avoid calling mstime() on each iteration, we will

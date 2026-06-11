@@ -33,6 +33,7 @@
 #include "cluster_migrateslots.h"
 #include "script.h"
 #include "threadsave.h"
+#include "bgiteration.h"
 #include "intset.h"
 #include "sds.h"
 #include "fpconv_dtoa.h"
@@ -6091,7 +6092,7 @@ void rewriteClientCommandArgument(client *c, int i, robj *newval) {
  * the caller wishes. The main usage of this function currently is
  * enforcing the client output length limits. */
 size_t getClientOutputBufferMemoryUsage(client *c) {
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
         size_t repl_buf_size = 0;
         size_t repl_node_num = 0;
         size_t repl_node_size = sizeof(listNode) + sizeof(replBufBlock);
@@ -6110,6 +6111,16 @@ size_t getClientOutputBufferMemoryUsage(client *c) {
         usage += c->deferred_reply_bytes +
                  (list_item_size * listLength(c->deferred_reply));
     }
+
+    /* For threadsave-to-socket replicas, account for replication items queued
+     * in the iterator that haven't been written to the socket yet. */
+    if (c->flag.threadsave_managed && isThreadsaveToSocketActive()) {
+        int count = threadsaveActiveClientCount();
+        if (count > 0) {
+            usage += bgIteration_memoryInuseForReplication() / count;
+        }
+    }
+
     return usage;
 }
 
