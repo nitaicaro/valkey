@@ -504,10 +504,10 @@ int canFeedReplicaReplBuffer(client *replica) {
     /* Don't feed replicas that are still waiting for BGSAVE to start. */
     if (replica->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_START) return 0;
 
-    /* Don't feed replicas that are syncing via threadsave-to-socket. Replication
+    /* Don't feed replicas that are syncing via forkless-save-to-socket. Replication
      * data is inlined into the RDB stream by the iterator, so the shared replication
      * buffer is not needed for these clients. */
-    if (replica->flag.threadsave_managed && isThreadsaveToSocketActive()) return 0;
+    if (replica->flag.forkless_managed && isForklessSaveInProgress()) return 0;
 
     return 1;
 }
@@ -1264,6 +1264,10 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
     serverAssert(socket_target || !(req & REPLICA_REQ_RDB_MASK));
 
     int chosen_save_type = resolveBgsaveType();
+    if (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS && !(mincapa & REPLICA_CAPA_INBAND_REPL)) {
+        serverLog(LL_NOTICE, "Falling back to fork-based save for SYNC: replica does not support inline replication");
+        chosen_save_type = RDB_BGSAVE_TYPE_FORK;
+    }
 
     serverLog(LL_NOTICE, "Starting BGSAVE for SYNC with target: %s, using: %s, method: %s",
               socket_target ? "replicas sockets" : "disk",
@@ -1668,7 +1672,7 @@ void freeClientReplicationData(client *c) {
  * the primary can accurately lists replicas and their listening ports in the
  * INFO output.
  *
- * - capa <eof|psync2|dual-channel|skip-rdb-checksum|lz4>
+ * - capa <eof|psync2|dual-channel|skip-rdb-checksum|lz4|inband-repl>
  * What is the capabilities of this instance.
  * eof: supports EOF-style RDB transfer for diskless replication.
  * psync2: supports PSYNC v2, so understands +CONTINUE <new repl ID>.
@@ -1676,6 +1680,7 @@ void freeClientReplicationData(client *c) {
  * skip-rdb-checksum: supports skipping RDB checksum calculations during diskless sync using
  *                    a connection that has integrity checks (such as TLS).
  * lz4: accepts LZ4 streaming-compressed replication payloads.
+ * inband-repl: supports RDB_OPCODE_UPDATE for inline replication during forkless save.
  *
  * - ack <offset> [fack <aofofs>]
  * Replica informs the primary the amount of replication stream that it
@@ -1760,6 +1765,8 @@ void replconfCommand(client *c) {
             /* "lz4": the replica accepts LZ4 streaming-compressed replication payloads. */
             else if (!strcasecmp(objectGetVal(c->argv[j + 1]), REPLICA_CAPA_LZ4_STR))
                 c->repl_data->replica_capa |= REPLICA_CAPA_LZ4;
+            else if (!strcasecmp(objectGetVal(c->argv[j + 1]), REPLICA_CAPA_INBAND_REPL_STR))
+                c->repl_data->replica_capa |= REPLICA_CAPA_INBAND_REPL;
         } else if (!strcasecmp(objectGetVal(c->argv[j]), "ack")) {
             /* REPLCONF ACK is used by replica to inform the primary the amount
              * of replication stream that it processed so far. It is an
@@ -4410,6 +4417,13 @@ int syncWithPrimaryHandleSendHandshakeState(connection *conn) {
         lens[argc] = strlen(REPLICA_CAPA_SKIP_RDB_CHECKSUM_STR);
         argc++;
     }
+    /* This build understands RDB_OPCODE_UPDATE for inline replication. */
+    argv[argc] = "capa";
+    lens[argc] = strlen("capa");
+    argc++;
+    argv[argc] = REPLICA_CAPA_INBAND_REPL_STR;
+    lens[argc] = strlen(REPLICA_CAPA_INBAND_REPL_STR);
+    argc++;
     if (server.dual_channel_replication) {
         argv[argc] = "capa";
         lens[argc] = strlen("capa");

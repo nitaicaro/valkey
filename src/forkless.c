@@ -1016,7 +1016,7 @@ int forklessSaveToSockets(void) {
     /* Write diskless sync framing before the RDB header.
      * The replica expects: $EOF:<40-byte-marker>\r\n<RDB data><marker>\r\n */
     if (rdbWriteEofMarkStart(&saveInfo->save_rio, saveInfo->u.repl.eofmark) == C_ERR) {
-        serverLog(LL_WARNING, "threadsave: error writing EOF start marker");
+        serverLog(LL_WARNING, "forkless-save: error writing EOF start marker");
         goto werr;
     }
 
