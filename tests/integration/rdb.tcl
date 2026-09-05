@@ -1750,4 +1750,56 @@ test {Server starts with bgsave-default-method before forkless-infrastructure-en
     }
 }
 
+start_server {overrides {
+    forkless-infrastructure-enabled yes
+    save ""
+    lazyfree-lazy-server-del no
+} keep_persistence true} {
+    test "RENAME over an existing key during a forkless bgsave keeps the snapshot complete" {
+
+        # Equal length key names and no TTLs, so the entry RENAME allocates for
+        # the destination is the same size as the one it just freed and the
+        # allocator hands back that address.
+        set n 600
+        for {set i 0} {$i < $n} {incr i} {
+            set suffix [format %05d $i]
+            r set aa$suffix v$suffix
+            r set bb$suffix w$suffix
+        }
+
+        # The snapshot is a point in time taken before any of the renames below,
+        # so it has to contain exactly what the keyspace holds right now.
+        set expected_keys [lsort [r keys *]]
+
+        r config set rdb-key-save-delay 2000
+        r config set bgsave-default-method forkless
+        r bgsave
+        wait_for_condition 50 100 {
+            [s rdb_bgsave_in_progress] == 1
+        } else {
+            fail "forkless bgsave did not start"
+        }
+
+        # RENAME frees the destination entry and reallocates it inside one
+        # command. Before the fix the freed address stayed in the iterator's
+        # early-iterate set, so hashtableAdd() of the replacement collided with
+        # it (bgiteration.c "wasAdded" assertion) and, where it did not collide,
+        # a live key inherited the "already iterated" marker and was left out of
+        # the snapshot.
+        for {set i 0} {$i < $n} {incr i} {
+            set suffix [format %05d $i]
+            r rename aa$suffix bb$suffix
+            if {$i % 50 == 0 && [s rdb_bgsave_in_progress] == 0} break
+        }
+        assert_equal {PONG} [r ping]
+
+        r config set rdb-key-save-delay 0
+        waitForBgsave r
+        assert_equal "ok" [s rdb_last_bgsave_status]
+
+        restart_server 0 true false
+        assert_equal $expected_keys [lsort [r keys *]]
+    } {} {needs:debug}
+}
+
 } ;# tags
