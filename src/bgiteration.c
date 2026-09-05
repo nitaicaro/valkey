@@ -2309,6 +2309,38 @@ void bgIteration_flushall(void) {
 }
 
 
+/* Clients that cannot be blocked while an iteration holds one of their keys, and
+ * must instead wait synchronously for the iterator(s) to hand the key back.
+ *
+ *  - Scripts are not required to declare their keys, and a declared key does not
+ *    carry a DB, so after a SELECT or SWAPDB we can reach a key we never blocked
+ *    for.  There is no option but to wait.  (Yuck.)
+ *
+ *  - Replicated clients - the primary link on a replica, and a slot-migration
+ *    import client - must not be blocked at all.  blockClient() asserts this
+ *    (blocked.c:109), because the replication stream is a single ordered channel:
+ *    blockClientInUseOnKeys() clears the read handler and leaves pending_command
+ *    set, so the whole stream stops and reploff stops advancing for the duration
+ *    of the block.  Waiting synchronously costs the same wall time but keeps the
+ *    stream and the offset moving. */
+static bool clientMustWaitSynchronously(client *c) {
+    return c->flag.script || isReplicatedClient(c);
+}
+
+/* Rate-limited notice that we had to wait on the main thread.  Synchronous waits
+ * stall the server, so they are worth surfacing, but they can arrive in bursts. */
+static void logSynchronousWait(void) {
+    static const mstime_t SYNC_BLOCKING_LOG_INTERVAL = 60000;
+    static mstime_t last_log = 0; // STATIC: persists to prevent log spamming
+    static int blocked_count = 0; // STATIC: persistent count since last log
+    blocked_count++;
+    if (server.mstime - last_log > SYNC_BLOCKING_LOG_INTERVAL) {
+        serverLog(LL_WARNING, "Forkless operation synchronously waited %d times for in-use keys", blocked_count);
+        last_log = server.mstime;
+        blocked_count = 0;
+    }
+}
+
 // PUBLIC API
 bool bgIteration_blockClientIfRequired(client *c) {
     serverAssert(hasMainThreadExclusivity());
@@ -2341,8 +2373,19 @@ bool bgIteration_blockClientIfRequired(client *c) {
     hashtable *waitOnKeys = hashtableCreate(&tempKeysetHashtableType); // set of robj(sds)
     listEmpty(curCmdMissingKeys);
 
+    /* Some clients cannot be blocked, and must wait synchronously instead.  See
+     * clientMustWaitSynchronously() for who they are and why. */
+    bool waitSynchronously = clientMustWaitSynchronously(c);
+
     if (c->cmd->proc == execCommand) {
         mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
+
+        while (mustBlock && waitSynchronously) {
+            logSynchronousWait();
+            receiveItemsBackFromIterators(true); // Blocking
+            hashtableEmpty(waitOnKeys, NULL);
+            mustBlock = expediteKeysForMultiExec(c, waitOnKeys);
+        }
     } else {
         getKeysResult result;
         initGetKeysResult(&result);
@@ -2351,34 +2394,15 @@ bool bgIteration_blockClientIfRequired(client *c) {
         if (numkeys > 0) {
             mustBlock = expediteKeysForWriteOnAllIterators(
                 c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
-            // We shouldn't need to block on a command within a multi (that's not a script)
-            serverAssert(!(mustBlock && c->flag.multi && !c->flag.script));
+            // We shouldn't need to block on a command within a multi (that's not waiting synchronously)
+            serverAssert(!(mustBlock && c->flag.multi && !waitSynchronously));
 
-            if (mustBlock && (c->flag.script)) {
-                /* For scripts, we will block for keys declared in EVAL/EVALSHA/FCALL.
-                 *  However, scripts are NOT required to declare keys.  Even if it declares keys,
-                 *  it's not declaring the DB for the key.  After a SELECT or SWAPDB, we might be on
-                 *  a key we haven't blocked for.  In this case, there is no option but to execute a
-                 *  synchronous block and wait for the iterator(s) to be done with the key(s).
-                 *  (Yuck.)  */
-                static const mstime_t SYNC_BLOCKING_LOG_INTERVAL = 60000;
-                static mstime_t last_log = 0; // STATIC: persists to prevent log spamming
-                static int blocked_count = 0; // STATIC: persistent count since last log
-                blocked_count++;
-                if (server.mstime - last_log > SYNC_BLOCKING_LOG_INTERVAL) {
-                    serverLog(LL_WARNING,
-                              "Forkless operation synchronously blocked %d times for scripts with undeclared keys",
-                              blocked_count);
-                    last_log = server.mstime;
-                    blocked_count = 0;
-                }
-
-                while (mustBlock) {
-                    receiveItemsBackFromIterators(true); // Blocking
-                    hashtableEmpty(waitOnKeys, NULL);
-                    mustBlock = expediteKeysForWriteOnAllIterators(
-                        c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
-                }
+            while (mustBlock && waitSynchronously) {
+                logSynchronousWait();
+                receiveItemsBackFromIterators(true); // Blocking
+                hashtableEmpty(waitOnKeys, NULL);
+                mustBlock = expediteKeysForWriteOnAllIterators(
+                    c->db->id, c->cmd, c->argc, c->argv, keyrefs, numkeys, waitOnKeys);
             }
         } else {
             // WRITE commands with no keys should always be replicated.  SWAPDB, FLUSH, FUNCTION, etc.
