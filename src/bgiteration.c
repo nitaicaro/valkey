@@ -404,6 +404,11 @@ struct bgIterator {
 
     bool cur_cmd_may_replicate; // Used only in main thread during command processing
 
+    /* Whether the entry removed by the most recent bgIteration_keyDelete() had been
+     * iterated early.  Evaluated there, while the dbEntry pointer is still valid,
+     * and consumed when the DEL/UNLINK is replicated. */
+    bool last_key_delete_was_early_iterated;
+
     // Variables maintaining runtime statistics
     unsigned long dbentries_queued;         // Updated by main thread
     unsigned long dbentries_processed;      // Updated by client thread
@@ -470,9 +475,9 @@ static bool iteratorReplicationFlagsWereUpdated;
  *   1. bgIteration_keyDelete() is called
  *   2. the key is physically deleted
  *   3. replication is generated
- * At the time of replication, we need the (deleted) dbEntry pointer to be able to check
- * early_iterated_entries.  This variable stores the pointer from the last call of keyDelete() */
-static dbEntry *dbEntryPtrOfLastKeyDelete;
+ * The check against early_iterate_entries needs the dbEntry pointer, which is only valid at
+ * step 1, so keyDelete() records that answer per iterator in
+ * last_key_delete_was_early_iterated. */
 
 /* BgIteration debug captures BgIteration activity to a large sds buffer.  When an iterator is
  * completed, the entire buffer is written to a file in the current working directory.  Note that
@@ -2037,6 +2042,7 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->completed = false;
     it->terminated = false;
     it->cur_cmd_may_replicate = false;
+    it->last_key_delete_was_early_iterated = false;
 
     it->dbentries_queued = 0;
     it->dbentries_processed = 0;
@@ -2275,8 +2281,6 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
     dbEntry *de = dbFind(server.db[dbid], (sds)key);
     serverAssert(de != NULL); // This API should be called BEFORE removal from main dict
 
-    dbEntryPtrOfLastKeyDelete = de; // save for check at replication time
-
     // For consistent iterators, we need to make sure the item gets written before delete
     listIter li;
     listNode *node;
@@ -2291,6 +2295,29 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
                 addEarlyIterationKey(it, de, dbid); // (may also add to inUseEntries)
             }
         }
+    }
+
+    /* This dbEntry is about to leave the DB, so every reference to it by address
+     * becomes stale.  The allocator can hand the same address back immediately -
+     * RENAME frees the destination entry and then allocates a same-sized entry for
+     * the source robj, and gets that address - so a pointer left behind in
+     * early_iterate_entries starts describing a different, live key.  It then
+     * collides in hashtableAdd(), and it makes iteratorHasPassedKey() report a key
+     * as already iterated when it is not, so the key is missing from the snapshot.
+     *
+     * Drop it here, which is the one place we know the entry is leaving the DB.
+     * Every removal reaches this function (dbGenericDeleteWithDictIndex), so this
+     * also covers a collection emptied by SREM/LPOP/HDEL/ZREM, expiration and
+     * eviction - none of which propagate as DEL, so none of which used to clean up.
+     *
+     * Replicating the DEL still has to know whether this entry had been iterated
+     * early, so record that before dropping it.  Only this half of the answer
+     * depends on the pointer; the rest is still evaluated at replication time. */
+    listRewind(allIterators, &li);
+    while ((node = listNext(&li)) != NULL) {
+        bgIterator *it = listNodeValue(node);
+        it->last_key_delete_was_early_iterated = hashtableFind(it->early_iterate_entries, de, NULL);
+        hashtableDelete(it->early_iterate_entries, de);
     }
 
     /* We might be within the context of a command execution.  This happens if the key is found to
@@ -2605,12 +2632,13 @@ void bgIteration_handleCommandReplication(int dbid,
                     // Here we know that the DEL is related to the running command
                     shouldReplicateDelCommand = it->cur_cmd_may_replicate;
                 } else {
-                    // Otherwise, it's something like active expiration or eviction (unrelated)
-                    if (iteratorHasPassedKey(it, dbid, key, dbEntryPtrOfLastKeyDelete)) {
+                    /* Otherwise, it's something like active expiration or eviction (unrelated).
+                     * The early-iterate half of this answer was recorded by keyDelete(), since
+                     * the dbEntry pointer it needs is no longer valid here. */
+                    if (iteratorHasPassedKey(it, dbid, key, NULL) || it->last_key_delete_was_early_iterated) {
                         shouldReplicateDelCommand = true;
                     }
                 }
-                hashtableDelete(it->early_iterate_entries, dbEntryPtrOfLastKeyDelete); // just try delete (might not be here)
             }
         }
 
