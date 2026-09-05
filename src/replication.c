@@ -41,6 +41,7 @@
 #include "connection.h"
 #include "module.h"
 #include "cluster_migrateslots.h"
+#include "bgiteration.h"
 
 #include <memory.h>
 #include <sys/time.h>
@@ -2400,6 +2401,14 @@ void replicaBeforeLoadPrimaryRDB(connection *conn, int use_diskless_load) {
         }
         killRDBChild();
     }
+
+    /* The replica is about to replace its whole dataset, so any background
+     * iteration - a forkless save, or a full sync we are serving to our own
+     * replicas - has to stop scanning the kvstores and hand back the entries it
+     * borrowed. The paths that empty the data first get this through
+     * emptyData(-1, ...), but repl-diskless-load swapdb deliberately does not
+     * empty (it swaps and discards instead), so notify bgIteration here. */
+    bgIteration_flushall();
 
     /* Before loading the DB into memory we need to delete the readable
      * handler, otherwise it will get called recursively since
