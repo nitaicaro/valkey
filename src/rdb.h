@@ -259,6 +259,8 @@ void replicationEmptyDbCallback(hashtable *ht);
 ssize_t rdbSaveDbSizeHints(rio *rdb, serverDb *db, int include_importing);
 int rdbWriteHeader(rio *rdb, int req, int rdbver, int rdbflags, rdbSaveInfo *rsi);
 int rdbWriteFooter(rio *rdb, int req);
+int rdbWriteEofMarkStart(rio *rdb, char *eofmark);
+int rdbWriteEofMarkEnd(rio *rdb, const char *eofmark);
 void rdbRecordStartMetrics(int bgsave_type, int write_target);
 void rdbRecordEndMetrics(int bgsave_type, int status, time_t save_end);
 void rdbClearSaveState(time_t save_end);

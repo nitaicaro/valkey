@@ -709,7 +709,7 @@ static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
         return C_ERR;
     }
     int err = rdbWriteFooter(&saveInfo->save_rio, REPLICA_REQ_NONE);
-    if (rioWrite(&saveInfo->save_rio, saveInfo->u.repl.eofmark, RDB_EOF_MARK_SIZE) == 0) {
+    if (rdbWriteEofMarkEnd(&saveInfo->save_rio, saveInfo->u.repl.eofmark) == C_ERR) {
             serverLog(LL_WARNING, "forkless-save: error while writing valkey end eof string");
             return C_ERR;
         }
@@ -1003,9 +1003,6 @@ int forklessSaveToSockets(void) {
     serverAssert(listLength(saveInfo->u.repl.clients) > 0);
     saveInfo->foreground_queue = NULL;
 
-    /* Generate EOF marker for diskless sync */
-    getRandomHexChars(saveInfo->u.repl.eofmark, RDB_EOF_MARK_SIZE);
-
     /* Initialize RIO with ReplicaCOB. This lets the main thread write sync metadata
      * to all pending replicas through a single rioWrite() call in a non-blocking
      * manner — it places the data into each replica's Client Output Buffer (COB),
@@ -1018,9 +1015,7 @@ int forklessSaveToSockets(void) {
 
     /* Write diskless sync framing before the RDB header.
      * The replica expects: $EOF:<40-byte-marker>\r\n<RDB data><marker>\r\n */
-    if (rioWrite(&saveInfo->save_rio, "$EOF:", 5) == 0
-     || rioWrite(&saveInfo->save_rio, saveInfo->u.repl.eofmark, RDB_EOF_MARK_SIZE) == 0
-     || rioWrite(&saveInfo->save_rio, "\r\n", 2) == 0) {
+    if (rdbWriteEofMarkStart(&saveInfo->save_rio, saveInfo->u.repl.eofmark) == C_ERR) {
         serverLog(LL_WARNING, "threadsave: error writing EOF start marker");
         goto werr;
     }

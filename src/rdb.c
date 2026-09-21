@@ -1612,17 +1612,33 @@ static void rdbCompressionFree(rio *rdb, streamWriter *writer);
  * While the suffix is the 40 bytes hex string we announced in the prefix.
  * This way processes receiving the payload can understand when it ends
  * without doing any processing of the content. */
+
+/* Generate a fresh diskless-replication EOF mark into eofmark (which must be
+ * RDB_EOF_MARK_SIZE bytes) and write the "$EOF:<mark>\r\n" prefix that precedes
+ * the RDB payload. The caller keeps eofmark to pass to rdbWriteEofMarkEnd. */
+int rdbWriteEofMarkStart(rio *rdb, char *eofmark) {
+    getRandomHexChars(eofmark, RDB_EOF_MARK_SIZE);
+    if (rioWrite(rdb, "$EOF:", 5) == 0) return C_ERR;
+    if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) return C_ERR;
+    if (rioWrite(rdb, "\r\n", 2) == 0) return C_ERR;
+    return C_OK;
+}
+
+/* Write the diskless-replication EOF-mark that follows the RDB payload; it
+ * repeats the mark announced by rdbWriteEofMarkStart. */
+int rdbWriteEofMarkEnd(rio *rdb, const char *eofmark) {
+    if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) return C_ERR;
+    return C_OK;
+}
+
 static int rdbSaveRioWithEOFMark(int req, int rdbver, rio *rdb, int *error, rdbSaveInfo *rsi, compressionAlgo compression_algo) {
     char eofmark[RDB_EOF_MARK_SIZE];
     streamWriter compression_writer;
     bool compression_initialized = false;
 
     startSaving(RDBFLAGS_REPLICATION);
-    getRandomHexChars(eofmark, RDB_EOF_MARK_SIZE);
     if (error) *error = 0;
-    if (rioWrite(rdb, "$EOF:", 5) == 0) goto werr;
-    if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
-    if (rioWrite(rdb, "\r\n", 2) == 0) goto werr;
+    if (rdbWriteEofMarkStart(rdb, eofmark) == C_ERR) goto werr;
 
     /* Compress only the RDB body; the $EOF prefix/suffix stay plaintext. The
      * VCS frame owns checksum policy, so drop the outer RDB CRC64. */
@@ -1648,7 +1664,7 @@ static int rdbSaveRioWithEOFMark(int req, int rdbver, rio *rdb, int *error, rdbS
         compression_initialized = false;
     }
 
-    if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) goto werr;
+    if (rdbWriteEofMarkEnd(rdb, eofmark) == C_ERR) goto werr;
     stopSaving(1);
     return C_OK;
 
