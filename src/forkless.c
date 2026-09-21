@@ -338,12 +338,12 @@ static void abandonClient(forklessSaveInfo *saveInfo, client *c) {
     serverLog(LL_WARNING, "forkless-save: client(%llu) unresponsive.  %d clients remain.",
             (unsigned long long)c->id, remaining);
 
-    // If the client connection is part of a connection set, remove it
+    /* If the client connection is part of a connection set, remove it */
     if (rioCheckType(&saveInfo->save_rio) == RIO_TYPE_CONNSET) {
         rioFreeConnectionFromConnset(&saveInfo->save_rio, c->conn);
     }
 
-    // Before passing it back to the main thread, set the connection back to non-blocking
+    /* Before passing it back to the main thread, set the connection back to non-blocking */
     if (connSetBlocking(c->conn, false) == C_ERR) {
         serverLog(LL_WARNING, "forkless-save: error returning client(%llu) to non-blocking.", (unsigned long long)c->id);
     }
@@ -368,7 +368,7 @@ static void handleClosingClients(forklessSaveInfo *saveInfo) {
     }
 }
 
-// Before writing directly to the connection, we need to wait for various buffers to drain.
+/* Before writing directly to the connection, we need to wait for various buffers to drain. */
 static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
     serverAssert(!onServerMainThread());
     serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
@@ -381,7 +381,7 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
 
     const unsigned long loopDelayUs = 100000; // 100ms
 
-    // Give clients a chance to flush COBs
+    /* Give clients a chance to flush COBs */
     while (elapsedUs(startTimeMono) < (unsigned long long)server.repl_timeout * 1000000) {
         usleep(loopDelayUs);
         atomic_thread_fence(__ATOMIC_ACQUIRE);
@@ -392,7 +392,7 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
         bool allFlushed = true;
         while ((ln = listNext(&li)) != NULL) {
             client *c = listNodeValue(ln);
-            // Check for pending data in the COB
+            /* Check for pending data in the COB */
             if (clientHasPendingReplies(c)) {
                 allFlushed = false;
                 break;
@@ -401,7 +401,7 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
         if (allFlushed) break;
     }
 
-    // Kill off clients which still have COB data
+    /* Kill off clients which still have COB data */
     listRewind(saveInfo->u.repl.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
@@ -427,7 +427,7 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
     listNode *ln;
     listIter li;
 
-    // Set remaining clients to blocking
+    /* Set remaining clients to blocking */
     listRewind(saveInfo->u.repl.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
@@ -437,11 +437,11 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
         }
     }
 
-    // Hopefully we still have some clients left
+    /* Hopefully we still have some clients left */
     int numConns = listLength(saveInfo->u.repl.clients);
     if (numConns == 0) return C_ERR;
 
-    // At this point, we are done with ReplicaCOB RIO.
+    /* At this point, we are done with ReplicaCOB RIO. */
     uint64_t current_cksum = saveInfo->save_rio.cksum;
     size_t current_processed_bytes = saveInfo->save_rio.processed_bytes;
     rioFreeReplicaCOB(&saveInfo->save_rio);
@@ -468,15 +468,15 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
 static void resumeRegularReplicaActivity(client *c) {
     serverAssert(onServerMainThread());
 
-    // Set the connection back to non-block to make sure
-    // don't hang the main thread.
+    /* Set the connection back to non-block to make sure
+     * don't hang the main thread. */
     if (connSetBlocking(c->conn, false) == C_ERR) {
         serverLog(LL_WARNING, "forkless-save: error returning client(%llu) to non-blocking.", (unsigned long long)c->id);
     }
 
     c->flag.forkless_managed = 0;
 
-    // Since this is a replica client, re-register with priority
+    /* Since this is a replica client, re-register with priority */
     connSetReadHandler(c->conn, readQueryFromClient);
     connSetPrivateData(c->conn, c);
 }
@@ -685,12 +685,12 @@ static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
     }
 
     /* Write EOF, checksum, and eofmark into the COB */
-    // After loading a for-sync save, the replica needs to continue replicating from the
-    //  correct point in the replication stream.
-    // If using socket based replication, the replication stream is included with the
-    //  snapshot data.  The replica will continue after the last item seen.  Since this end
-    //  marker is being written synchronously on the main thread, we could simply save replication
-    //  AUX fields based on the latest replication staus on the main thread.
+    /* After loading a for-sync save, the replica needs to continue replicating from the
+     * correct point in the replication stream.
+     * If using socket based replication, the replication stream is included with the
+     * snapshot data. The replica will continue after the last item seen. Since this end
+     * marker is being written synchronously on the main thread, we could simply save replication
+     * AUX fields based on the latest replication staus on the main thread. */
     rdbSaveInfo rsi, *rsiptr;
     rsiptr = rdbPopulateSaveInfo(&rsi);
     serverAssert(rsiptr);
@@ -709,20 +709,20 @@ static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
     saveInfo->bytes_written = saveInfo->save_rio.processed_bytes;
 
     if (err == C_OK) {
-        // The COB is currently not sending.  At this point, we set a STOP position after the end
-        //  marker and re-enable COB writes.
+        /* The COB is currently not sending. At this point, we set a STOP position after the end
+         * marker and re-enable COB writes. */
         listRewind(saveInfo->u.repl.clients, &li);
         while ((ln = listNext(&li)) != NULL) {
             client *c = listNodeValue(ln);
 
-            // Don't write past the current point in the COB
+            /* Don't write past the current point in the COB */
             pauseCobSendAtCurrentPositionForAck(c);
 
-            // Start sending
+            /* Start sending */
             resumeReplicaWrites(c);
         }
 
-        // REPLCONF will be sent immediately after ACK is received
+        /* REPLCONF will be sent immediately after ACK is received */
         fixReplicationOffset(saveInfo);
     }
 
