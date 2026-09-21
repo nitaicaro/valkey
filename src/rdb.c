@@ -3771,29 +3771,26 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
                 }
             }
 
-            /* Look up and execute the command */
-            struct serverCommand *cmd = lookupCommand(argv, argc);
-            if (cmd) {
-                if (rdb_loading_ctx->update_client == NULL) {
-                    rdb_loading_ctx->update_client = createAOFClient();
-                    serverAssert(rdb_loading_ctx->update_client != NULL);
-                }
-                client *fakeClient = rdb_loading_ctx->update_client;
-                fakeClient->argc = argc;
-                fakeClient->argv = argv;
-                fakeClient->argv_len = argc;
-                fakeClient->cmd = fakeClient->lastcmd = cmd;
-                fakeClient->db = db;
-                cmd->proc(fakeClient);
-                fakeClient->cmd = NULL;
-                /* Reset client but don't free argv — we free below */
-                fakeClient->argc = 0;
-                fakeClient->argv = NULL;
-                fakeClient->argv_len = 0;
+            /* Create the fake client the first time we see an inline command,
+             * then reuse it. Most loads have no inline commands, so we avoid
+             * making one until it is actually needed. */
+            if (rdb_loading_ctx->update_client == NULL) {
+                rdb_loading_ctx->update_client = createAOFClient();
             }
+            client *fakeClient = rdb_loading_ctx->update_client;
+            fakeClient->db = db;
 
-            for (j = 0; j < argc; j++) decrRefCount(argv[j]);
-            zfree(argv);
+            /* On an unknown or invalid command, stop the load. Skipping it
+             * would leave this replica with different data than the primary. */
+            sds err = NULL;
+            if (loadCommandFromArgv(fakeClient, argv, argc, NULL, &err) == C_ERR) {
+                serverLog(LL_WARNING, "Error applying inline command from RDB stream: %s", err);
+                sdsfree(err);
+                /* loadCommandFromArgv already freed argv via the fake client. */
+                goto eoferr;
+            }
+            fakeClient->cmd = NULL;
+            /* argv was freed by loadCommandFromArgv (through the fake client). */
             continue;
         }
 

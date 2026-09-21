@@ -3693,6 +3693,7 @@ struct serverCommand *lookupCommandByCString(const char *s);
 struct serverCommand *lookupCommandOrOriginal(robj **argv, int argc);
 int commandCheckExistence(client *c, sds *err);
 int commandCheckArity(struct serverCommand *cmd, int argc, sds *err);
+int loadCommandFromArgv(client *fakeClient, robj **argv, int argc, int *is_multi_start, sds *err);
 void startCommandExecution(void);
 int incrCommandStatsOnError(struct serverCommand *cmd, int flags);
 void call(client *c, int flags);
