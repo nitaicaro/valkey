@@ -2379,7 +2379,7 @@ int freeClient(client *c) {
         if (c->flag.close_asap) return; /* Already marked, don't double-process. */
 
         serverLog(LL_NOTICE,
-                  "freeClient: master trying to free client(%llu) owned by forkless save",
+                  "freeClient: primary trying to free client(%llu) owned by forkless save",
                   (unsigned long long)c->id);
 
         /* Remove from server.replicas now so disconnectReplicas() won't block on it. */
