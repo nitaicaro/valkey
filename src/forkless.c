@@ -335,8 +335,13 @@ static void abandonClient(forklessSaveInfo *saveInfo, client *c) {
     listDelNode(saveInfo->u.repl.clients, ln);
 
     int remaining = listLength(saveInfo->u.repl.clients);
-    serverLog(LL_WARNING, "forkless-save: client(%llu) unresponsive.  %d clients remain.",
-            (unsigned long long)c->id, remaining);
+    if (c->flag.forkless_pending_close) {
+        serverLog(LL_WARNING, "forkless-save: client(%llu) closed by primary. %d clients remain.",
+                (unsigned long long)c->id, remaining);
+    } else {
+        serverLog(LL_WARNING, "forkless-save: client(%llu) unresponsive. %d clients remain.",
+                (unsigned long long)c->id, remaining);
+    }
 
     /* If the client connection is part of a connection set, remove it */
     if (rioCheckType(&saveInfo->save_rio) == RIO_TYPE_CONNSET) {
@@ -363,6 +368,10 @@ static void handleClosingClients(forklessSaveInfo *saveInfo) {
         client *c = listNodeValue(ln);
         waitForClientIO(c);
         if (c->flag.forkless_pending_close || !c->conn || connGetState(c->conn) != CONN_STATE_CONNECTED) {
+            if (c->flag.forkless_pending_close) {
+                serverLog(LL_DEBUG, "forkless-save: detected pending close on client(%llu).",
+                          (unsigned long long)c->id);
+            }
             abandonClient(saveInfo, c);
         }
     }
