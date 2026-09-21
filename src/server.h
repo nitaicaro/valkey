@@ -691,6 +691,14 @@ typedef enum {
     RDB_BGSAVE_TYPE_FORKLESS = 2 /* Forkless bgsave. */
 } rdbBgsaveType;
 
+/* Result of the RESP command parse helpers (parseRespHeaderFromReader,
+ * parseRespArgsFromReader). */
+typedef enum {
+    RESP_PARSE_OK = 0, /* Parsed successfully. */
+    RESP_PARSE_EOF,    /* Reader hit end of input (possibly a truncated tail). */
+    RESP_PARSE_FMTERR  /* Malformed input (bad protocol bytes). */
+} respParseResult;
+
 /* Replica failover policy for server.cluster_replica_no_failover. */
 typedef enum {
     CLUSTER_REPLICA_NO_FAILOVER_NO = 0,   /* Allow automatic failover (default). */
@@ -3694,6 +3702,8 @@ struct serverCommand *lookupCommandOrOriginal(robj **argv, int argc);
 int commandCheckExistence(client *c, sds *err);
 int commandCheckArity(struct serverCommand *cmd, int argc, sds *err);
 int loadCommandFromArgv(client *fakeClient, robj **argv, int argc, int *is_multi_start, sds *err);
+respParseResult parseRespHeaderFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx, int *argc_out);
+respParseResult parseRespArgsFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx, int argc, robj ***argv_out);
 void startCommandExecution(void);
 int incrCommandStatsOnError(struct serverCommand *cmd, int flags);
 void call(client *c, int flags);

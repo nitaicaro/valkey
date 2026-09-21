@@ -4550,6 +4550,95 @@ int commandCheckArity(struct serverCommand *cmd, int argc, sds *err) {
     return 1;
 }
 
+/* Read a RESP multi-bulk header (*<argc>\r\n) through read_fn and return the
+ * argument count in *argc_out.
+ *
+ * read_fn must read exactly len bytes into buf and return len on success or 0
+ * on failure (same contract as rioRead). ctx is passed back untouched so the
+ * source (rio, FILE, ...) is opaque to this parser.
+ *
+ * Returns RESP_PARSE_OK with *argc_out set, RESP_PARSE_EOF if the bytes could
+ * not be read, or RESP_PARSE_FMTERR if the header is malformed. */
+respParseResult parseRespHeaderFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx,
+                                          int *argc_out) {
+    char buf[128];
+
+    if (read_fn(ctx, buf, 1) == 0) return RESP_PARSE_EOF;
+    if (buf[0] != '*') return RESP_PARSE_FMTERR;
+    int pos = 0;
+    while (pos < (int)sizeof(buf) - 1) {
+        if (read_fn(ctx, buf + pos, 1) == 0) return RESP_PARSE_EOF;
+        if (buf[pos] == '\n') break;
+        pos++;
+    }
+    buf[pos] = '\0'; /* overwrite \n; buf may have a trailing \r */
+    int argc = atoi(buf);
+    if (argc < 1) return RESP_PARSE_FMTERR;
+    *argc_out = argc;
+    return RESP_PARSE_OK;
+}
+
+/* Read argc RESP arguments ($<len>\r\n<data>\r\n each) through read_fn into a
+ * freshly allocated argv, returned in *argv_out. The caller must already know
+ * argc (see parseRespHeaderFromReader) and owns argv and its objects on OK.
+ *
+ * read_fn has the same contract as in parseRespHeaderFromReader. Returns
+ * RESP_PARSE_OK, RESP_PARSE_EOF, or RESP_PARSE_FMTERR; on error any partial
+ * allocation is freed and *argv_out is left untouched. */
+respParseResult parseRespArgsFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx, int argc,
+                                        robj ***argv_out) {
+    char buf[128];
+    int j;
+    respParseResult result;
+
+    robj **argv = zmalloc(sizeof(robj *) * argc);
+    for (j = 0; j < argc; j++) {
+        if (read_fn(ctx, buf, 1) == 0) {
+            result = RESP_PARSE_EOF;
+            goto err;
+        }
+        if (buf[0] != '$') {
+            result = RESP_PARSE_FMTERR;
+            goto err;
+        }
+        int pos = 0;
+        while (pos < (int)sizeof(buf) - 1) {
+            if (read_fn(ctx, buf + pos, 1) == 0) {
+                result = RESP_PARSE_EOF;
+                goto err;
+            }
+            if (buf[pos] == '\n') break;
+            pos++;
+        }
+        buf[pos] = '\0';
+        long len = strtol(buf, NULL, 10);
+
+        sds argsds = sdsnewlen(SDS_NOINIT, len);
+        if (len && read_fn(ctx, argsds, len) == 0) {
+            sdsfree(argsds);
+            result = RESP_PARSE_EOF;
+            goto err;
+        }
+        argv[j] = createObject(OBJ_STRING, argsds);
+
+        /* Discard the trailing \r\n. */
+        char crlf[2];
+        if (read_fn(ctx, crlf, 2) == 0) {
+            j++; /* argv[j] was assigned above; free it too. */
+            result = RESP_PARSE_EOF;
+            goto err;
+        }
+    }
+
+    *argv_out = argv;
+    return RESP_PARSE_OK;
+
+err:
+    for (int k = 0; k < j; k++) decrRefCount(argv[k]);
+    zfree(argv);
+    return result;
+}
+
 /* Run one command that has already been parsed into argv/argc, using a fake
  * client. This is used when we replay commands while loading data. The fake
  * client sends no reply and is never allowed to block.

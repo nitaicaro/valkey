@@ -3651,6 +3651,11 @@ int rdbLoadRioWithLoadingCtxScopedRdb(rio *rdb, int rdbflags, rdbSaveInfo *rsi, 
  * The rdb_loading_ctx argument holds objects to which the rdb will be loaded to,
  * currently it only allow to set db object and functionLibCtx to which the data
  * will be loaded (in the future it might contains more such objects). */
+/* Adapts rioRead to the read_fn signature used by parseRespCommandFromReader. */
+static size_t rdbRioReader(void *ctx, void *buf, size_t len) {
+    return rioRead((rio *)ctx, buf, len);
+}
+
 int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadingCtx *rdb_loading_ctx) {
     uint64_t dbid = 0;
     int type, rdbver;
@@ -3716,60 +3721,10 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
 
         /* Handle inline replication commands embedded during forkless save. */
         if (type == RDB_OPCODE_UPDATE) {
-            char buf[128];
-            int argc, j;
-
-            /* Read multi-bulk header: *<argc>\r\n */
-            if (rioRead(rdb, buf, 1) == 0 || buf[0] != '*') goto eoferr;
-            {
-                int pos = 0;
-                while (pos < (int)sizeof(buf) - 1) {
-                    if (rioRead(rdb, buf + pos, 1) == 0) goto eoferr;
-                    if (buf[pos] == '\n') break;
-                    pos++;
-                }
-                buf[pos] = '\0'; /* overwrite \n, buf may have trailing \r */
-                argc = atoi(buf);
-            }
-            if (argc < 1) goto eoferr;
-
-            /* Read each argument: $<len>\r\n<data>\r\n */
-            robj **argv = zmalloc(sizeof(robj *) * argc);
-            for (j = 0; j < argc; j++) {
-                if (rioRead(rdb, buf, 1) == 0 || buf[0] != '$') {
-                    for (int k = 0; k < j; k++) decrRefCount(argv[k]);
-                    zfree(argv);
-                    goto eoferr;
-                }
-                int pos = 0;
-                while (pos < (int)sizeof(buf) - 1) {
-                    if (rioRead(rdb, buf + pos, 1) == 0) {
-                        for (int k = 0; k < j; k++) decrRefCount(argv[k]);
-                        zfree(argv);
-                        goto eoferr;
-                    }
-                    if (buf[pos] == '\n') break;
-                    pos++;
-                }
-                buf[pos] = '\0';
-                long len = strtol(buf, NULL, 10);
-
-                sds argsds = sdsnewlen(SDS_NOINIT, len);
-                if (len && rioRead(rdb, argsds, len) == 0) {
-                    sdsfree(argsds);
-                    for (int k = 0; k < j; k++) decrRefCount(argv[k]);
-                    zfree(argv);
-                    goto eoferr;
-                }
-                argv[j] = createObject(OBJ_STRING, argsds);
-                /* Discard \r\n */
-                char crlf[2];
-                if (rioRead(rdb, crlf, 2) == 0) {
-                    for (int k = 0; k <= j; k++) decrRefCount(argv[k]);
-                    zfree(argv);
-                    goto eoferr;
-                }
-            }
+            robj **argv;
+            int argc;
+            if (parseRespHeaderFromReader(rdbRioReader, rdb, &argc) != RESP_PARSE_OK) goto eoferr;
+            if (parseRespArgsFromReader(rdbRioReader, rdb, argc, &argv) != RESP_PARSE_OK) goto eoferr;
 
             /* Create the fake client the first time we see an inline command,
              * then reuse it. Most loads have no inline commands, so we avoid
