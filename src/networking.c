@@ -2374,30 +2374,16 @@ int freeClient(client *c) {
         return 0;
     }
 
-    /* If forkless save owns this client, don't free it — forkless save will handle it. */
+    /* The forkless save's background thread may still be using this replica's
+     * connection, so we must not free it here. Instead, remove it from the
+     * replica tracking now and mark it for close; the forkless save owns the
+     * client and frees it when it is safe to do so. */
     if (c->flag.forkless_managed) {
-        if (c->flag.close_asap) return; /* Already marked, don't double-process. */
-
-        serverLog(LL_NOTICE,
-                  "freeClient: primary trying to free client(%llu) owned by forkless save",
+        if (c->flag.forkless_pending_close) return; /* Already marked, don't double-process. */
+        serverLog(LL_NOTICE, "freeClient: primary trying to free client(%llu) owned by forkless save",
                   (unsigned long long)c->id);
-
-        /* Remove from server.replicas now so disconnectReplicas() won't block on it. */
-        list *client_list = (c->flag.monitor) ? server.monitors : server.replicas;
-        listNode *ln = listSearchKey(client_list, c);
-        serverAssert(ln != NULL);
-        listDelNode(client_list, ln);
-
-        if (!(c->flag.monitor)) {
-            if (listLength(server.replicas) == 0) server.repl_no_replicas_since = server.unixtime;
-            refreshGoodReplicasCount();
-        }
-        c->flag.replica = 0;
-        c->flag.monitor = 0;
-
-        freeReplicaReferencedReplBuffer(c);
-
-        c->flag.close_asap = 1;
+        retireForklessManagedReplica(c);
+        c->flag.forkless_pending_close = 1;
         return;
     }
 

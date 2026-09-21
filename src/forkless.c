@@ -91,7 +91,7 @@ static int writeDbSizeHints(forklessSaveInfo *saveInfo) {
 
 /* Forward declarations for helper functions */
 static void abandonClient(forklessSaveInfo *saveInfo, client *c);
-static int pruneDisconnectedReplicas(forklessSaveInfo *saveInfo);
+static void handleClosingClients(forklessSaveInfo *saveInfo);
 static void waitForBuffersToDrain(forklessSaveInfo *saveInfo);
 static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo);
 
@@ -176,11 +176,13 @@ static void *forklessSaveProcessor(void *arg) {
     while (!done && err == C_OK) {
         bgIteratorItem *item = bgIteratorRead(saveInfo->iterator);
 
-        if (saveInfo->write_target == RDB_WRITE_TARGET_SOCKET)
-        if (pruneDisconnectedReplicas(saveInfo) <= 0) {
-            serverLog(LL_WARNING, "forkless-save: all replicas disconnected, aborting");
-            err = C_ERR;
-            break;
+        if (saveInfo->write_target == RDB_WRITE_TARGET_SOCKET) {
+            handleClosingClients(saveInfo);
+            if (listLength(saveInfo->u.repl.clients) == 0) {
+                serverLog(LL_WARNING, "forkless-save: all replicas disconnected, aborting");
+                err = C_ERR;
+                break;
+            }
         }
 
         switch (item->type) {
@@ -313,9 +315,10 @@ static void freeRecentlyTerminatedClients(forklessSaveInfo *saveInfo) {
     listRewind(saveInfo->u.repl.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-        if (c->flag.close_asap || c->flag.close_after_reply) {
+        if (c->flag.forkless_pending_close) {
             listDelNode(saveInfo->u.repl.clients, ln);
             c->flag.forkless_managed = 0;
+            c->flag.forkless_pending_close = 0;
             if (c->repl_data) c->repl_data->using_cob = 0;
             freeClient(c);
         }
@@ -350,8 +353,8 @@ static void abandonClient(forklessSaveInfo *saveInfo, client *c) {
     mutexQueueAdd(saveInfo->foreground_queue, c);
 }
 
-/* Returns the number of remaining connected replicas. */
-static int pruneDisconnectedReplicas(forklessSaveInfo *saveInfo) {
+/* Prunes replicas that are closing or disconnected. */
+static void handleClosingClients(forklessSaveInfo *saveInfo) {
     serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
     listNode *ln;
     listIter li;
@@ -359,9 +362,10 @@ static int pruneDisconnectedReplicas(forklessSaveInfo *saveInfo) {
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
         waitForClientIO(c);
-        // Check if client should be abandoned (simplified - no ElastiCache flags)
+        if (c->flag.forkless_pending_close || !c->conn || connGetState(c->conn) != CONN_STATE_CONNECTED) {
+            abandonClient(saveInfo, c);
+        }
     }
-    return listLength(saveInfo->u.repl.clients);
 }
 
 // Before writing directly to the connection, we need to wait for various buffers to drain.
@@ -382,7 +386,7 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
         usleep(loopDelayUs);
         atomic_thread_fence(__ATOMIC_ACQUIRE);
 
-        pruneDisconnectedReplicas(saveInfo);
+        handleClosingClients(saveInfo);
 
         listRewind(saveInfo->u.repl.clients, &li);
         bool allFlushed = true;
@@ -407,7 +411,7 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
         }
     }
 
-    pruneDisconnectedReplicas(saveInfo);
+    handleClosingClients(saveInfo);
 }
 
 /* This function waits until all of the COBs have drained and transitions RIO to a CONNSET.
@@ -925,6 +929,7 @@ static long long replicationMonitorTimeProc(struct aeEventLoop *eventLoop, long 
         serverLog(LL_WARNING, "forkless-save: client(%llu) ended replication early",
                   (unsigned long long)c->id);
         c->flag.forkless_managed = 0;
+        c->flag.forkless_pending_close = 0;
         if (c->repl_data) c->repl_data->using_cob = 0;
         if (c->repl_data) c->repl_data->repl_state = REPL_STATE_NONE;
         freeClient(c);
@@ -950,7 +955,7 @@ static bool forklessSaveReplDone(void *privdata) {
     listRewind(saveInfo->u.repl.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-        if (c->flag.close_asap) {
+        if (c->flag.forkless_pending_close) {
             serverLog(LL_NOTICE, "forkless-save: skipping client(%llu) marked for closure in repl done",
                       (unsigned long long)c->id);
             continue;

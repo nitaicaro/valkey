@@ -1281,6 +1281,8 @@ typedef struct ClientFlags {
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
     uint64_t forkless_managed : 1;         /* Client is owned by forkless save, don't free */
+    uint64_t forkless_pending_close : 1;   /* Main thread wants this forkless-owned client closed;
+                                            * the forkless save frees it when safe. */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -3421,6 +3423,7 @@ void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
 void freeReplicaReferencedReplBuffer(client *replica);
+void retireForklessManagedReplica(client *c);
 void replicationFeedMonitors(client *c, list *monitors, int dictid, robj **argv, int argc);
 void updateReplicasWaitingBgsave(int bgsaveerr, int type);
 void replicationCron(void);
