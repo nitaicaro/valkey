@@ -833,6 +833,15 @@ static void startBackgroundThread(forklessSaveInfo *saveInfo) {
     serverAssert(pthread_rc == 0);
 }
 
+static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
+    saveInfo->err_code = C_ERR;
+    rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, C_ERR, time(NULL));
+    rdbClearSaveState(time(NULL));
+    stopSaving(0);
+    currentForklessSave = NULL;
+    serverLog(LL_WARNING, "forkless-save: save failed. %lld seconds.", (long long)server.rdb_save_time_last);
+}
+
 /* Save a point-in-time snapshot to the given filename.
  * The filename must be under the server's current working directory.
  * Writes to a temp file and renames to the final filename on completion. */
@@ -890,12 +899,7 @@ int forklessSaveToDisk(const char *filename) {
     return C_OK;
 
 werr:
-    saveInfo->err_code = C_ERR;
-    rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, C_ERR, time(NULL));
-    rdbClearSaveState(time(NULL));
-    serverLog(LL_WARNING, "forkless-save: forkless save failed. %lld seconds.", (long long)server.rdb_save_time_last);
-    stopSaving(0);
-    currentForklessSave = NULL;
+    forklessMarkSaveFailed(saveInfo);
 
     if (file != NULL) {
         if (fclose(file) != 0) {
@@ -1081,7 +1085,7 @@ int forklessSaveToSockets(void) {
     return C_OK;
 
 werr:
-    currentForklessSave = NULL;
+    forklessMarkSaveFailed(saveInfo);
     if (saveInfo->foreground_queue) {
         /* Signal the monitor timer to stop */
         mutexQueueAdd(saveInfo->foreground_queue, (void *)PROCESS_COMPLETE_ITEM);
@@ -1090,10 +1094,6 @@ werr:
     if (saveInfo->u.repl.clients) {
         resumeClientsAndFreeClientList(saveInfo, false);
     }
-    saveInfo->err_code = C_ERR;
-    rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, C_ERR, time(NULL));
-    serverLog(LL_WARNING, "forkless-save: save failed.  %lld seconds.", (long long)server.rdb_save_time_last);
-    stopSaving(0);
     zfree(saveInfo);
     serverLog(LL_WARNING, "Error in forklessSaveToSockets before starting thread");
     return C_ERR;
