@@ -1901,12 +1901,12 @@ void replconfCommand(client *c) {
             }
             if (server.wait_for_psync_offset) {
                 serverLog(LL_NOTICE,
-                          "Received a request to update master reploff for psync, new psync offset: %lld.", offset);
+                          "Received a request to update primary reploff for psync, new psync offset: %lld.", offset);
                 server.primary_initial_offset = offset;
                 server.primary_repl_offset = offset;
                 server.repl_backlog->offset = server.primary_repl_offset + 1;
                 server.wait_for_psync_offset = 0;
-                server.primary->repl_data->read_reploff = offset + sdslen(c->querybuf) - c->qb_pos;
+                server.primary->repl_data->read_reploff = offset + sdslen(c->querybuf) - c->qb_applied;
                 server.skip_psync_offset = 1;
             } else {
                 serverLog(LL_WARNING, "Received unexpected request to update primary reploff for psync. Ignoring it.");
