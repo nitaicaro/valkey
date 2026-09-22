@@ -1921,16 +1921,6 @@ void replconfCommand(client *c) {
     addReply(c, shared.ok);
 }
 
-/* This function puts a replica in the online state, and should be called just
- * after a replica received the RDB file for the initial synchronization.
- *
- * It does a few things:
- * 1) Put the replica in ONLINE state.
- * 2) Update the count of "good replicas".
- * 3) Trigger the module event.
- *
- * the return value indicates that the replica should be disconnected.
- * */
 /* Suspend sending data to a replica until we receive a REPLCONF ACK.
  * Used by forkless-save-to-socket: after the RDB+EOF is queued in the COB,
  * we pause sending so the replica sees a clean EOF boundary. */
@@ -1953,8 +1943,17 @@ void resumeReplicaWrites(client *replica) {
     putClientInPendingWriteQueue(replica);
 }
 
+/* This function puts a replica in the online state, and should be called just
+ * after a replica received the RDB file for the initial synchronization.
+ *
+ * It does a few things:
+ * 1) Put the replica in ONLINE state.
+ * 2) Update the count of "good replicas".
+ * 3) Trigger the module event.
+ *
+ * the return value indicates that the replica should be disconnected.
+ * */
 int replicaPutOnline(client *replica) {
-    serverLog(LL_DEBUG, "replicaPutOnline called.  client=%llu", (unsigned long long)replica->id);
     resumeReplicaWrites(replica);
     if (replica->flag.repl_rdbonly) {
         replica->repl_data->repl_state = REPLICA_STATE_RDB_TRANSMITTED;
