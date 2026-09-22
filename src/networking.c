@@ -3838,10 +3838,10 @@ void processClientIOWriteDone(client *c) {
         if (!c || !c->conn) return;
     }
 
-    if (!clientHasPendingReplies(c)) return;
-    /* NITAI
-    // if (clientHasPendingReplies(c) && !(c->repl_data && c->repl_data->stop_send_data_until_ack)) {
-    */
+    /* A replica paused waiting for a full-sync ACK still needs its write path kept
+     * active even with no pending replies, so it can flush the paused COB up to the
+     * ACK point. */
+    if (!clientHasPendingReplies(c) && !(c->repl_data && c->repl_data->stop_send_data_until_ack)) return;
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
