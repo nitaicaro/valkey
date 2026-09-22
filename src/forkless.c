@@ -88,7 +88,7 @@ static int writeDbSizeHints(forklessSaveInfo *saveInfo) {
 }
 
 /* Forward declarations for helper functions */
-static void abandonClient(forklessSaveInfo *saveInfo, client *c);
+static void dropReplicaFromSaveAndQueueForMainThreadFree(forklessSaveInfo *saveInfo, client *c);
 static void handleClosingClients(forklessSaveInfo *saveInfo);
 static void waitForBuffersToDrain(forklessSaveInfo *saveInfo);
 static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo);
@@ -270,7 +270,7 @@ static void *forklessSaveProcessor(void *arg) {
             client *c = listNodeValue(ln);
             if (connSetBlocking(c->conn, false) == C_ERR) {
                 serverLog(LL_WARNING, "forkless-save: error returning client to non-blocking.");
-                abandonClient(saveInfo, c);
+                dropReplicaFromSaveAndQueueForMainThreadFree(saveInfo, c);
             }
         }
 
@@ -306,7 +306,7 @@ static void *forklessSaveProcessor(void *arg) {
 /* After the bg thread finishes, some clients may have been marked for close
  * (e.g., by the main thread's freeClient path). Remove them from the client
  * list so we don't try to finish the RDB stream to dead connections. */
-static void freeRecentlyTerminatedClients(forklessSaveInfo *saveInfo) {
+static void freeClientsMarkedForCloseAfterBgThreadStopped(forklessSaveInfo *saveInfo) {
     serverAssert(onServerMainThread());
 
     listNode *ln;
@@ -327,7 +327,7 @@ static void freeRecentlyTerminatedClients(forklessSaveInfo *saveInfo) {
 /* If a client is unresponsive or is being closed by the main thread, we might have to drop it
  * from the current replication activity.
  */
-static void abandonClient(forklessSaveInfo *saveInfo, client *c) {
+static void dropReplicaFromSaveAndQueueForMainThreadFree(forklessSaveInfo *saveInfo, client *c) {
     serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
     listNode *ln = listSearchKey(saveInfo->u.repl.clients, c);
     serverAssert(ln != NULL);
@@ -371,7 +371,7 @@ static void handleClosingClients(forklessSaveInfo *saveInfo) {
                 serverLog(LL_DEBUG, "forkless-save: detected pending close on client(%llu).",
                           (unsigned long long)c->id);
             }
-            abandonClient(saveInfo, c);
+            dropReplicaFromSaveAndQueueForMainThreadFree(saveInfo, c);
         }
     }
 }
@@ -415,7 +415,7 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
         client *c = listNodeValue(ln);
         if (clientHasPendingReplies(c)) {
             serverLog(LL_WARNING, "forkless-save: socket not draining (COB), client(%llu)", (unsigned long long)c->id);
-            abandonClient(saveInfo, c);
+            dropReplicaFromSaveAndQueueForMainThreadFree(saveInfo, c);
         }
     }
 
@@ -452,7 +452,7 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
         client *c = listNodeValue(ln);
         if (connSetBlocking(c->conn, true) == C_ERR) {
             serverLog(LL_WARNING, "forkless-save: unable to set blocking on client(%llu)", (unsigned long long)c->id);
-            abandonClient(saveInfo, c);
+            dropReplicaFromSaveAndQueueForMainThreadFree(saveInfo, c);
         }
     }
 
@@ -762,7 +762,7 @@ void forklessSaveComplete(bool terminated, void *privdata) {
 
     if (saveInfo->write_target == RDB_WRITE_TARGET_SOCKET) {
         /* Get rid of any clients which may have been closed after the bg thread completed. */
-        freeRecentlyTerminatedClients(saveInfo);
+        freeClientsMarkedForCloseAfterBgThreadStopped(saveInfo);
         if (listLength(saveInfo->u.repl.clients) == 0) saveInfo->terminated = true;
 
         if (!saveInfo->terminated && saveInfo->err_code == C_OK) {
