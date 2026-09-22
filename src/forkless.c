@@ -959,8 +959,11 @@ static long long replicationMonitorTimeProc(struct aeEventLoop *eventLoop, long 
 /* Called on the main thread when the bg iterator finishes iterating all keys.
  * This is the point where the bg thread is done writing key data, but the
  * end marker hasn't been written yet (that happens in forklessSaveComplete via
- * finishSocketBasedForklessSaveUsingCob). */
-static bool forklessSaveReplDone(void *privdata) {
+ * finishSocketBasedForklessSaveUsingCob).
+ *
+ * Note this only means we finished iterating the keyspace; live replication
+ * may still be flowing until we pause it here. */
+static bool forklessDoneIteratingKeyspace(void *privdata) {
     serverAssert(onServerMainThread());
 
     forklessSaveInfo *saveInfo = privdata;
@@ -1064,9 +1067,9 @@ int forklessSaveToSockets(void) {
     }
 
     /* Create iterator with CONSISTENCY_EVENTUAL flag (no consistent snapshot needed).
-     * forklessSaveReplDone is called on the main thread when iteration finishes. */
+     * forklessDoneIteratingKeyspace is called on the main thread when iteration finishes. */
     saveInfo->iterator = bgIteratorCreateFullScanIter(FORKLESS_SOCKET_ITER_NAME,
-            BGITERATOR_CONSISTENCY_EVENTUAL, forklessSaveReplDone, forklessSaveComplete, saveInfo);
+            BGITERATOR_CONSISTENCY_EVENTUAL, forklessDoneIteratingKeyspace, forklessSaveComplete, saveInfo);
     if (saveInfo->iterator == NULL) {
         serverLog(LL_WARNING, "forkless-save: error creating iterator");
         goto werr;
