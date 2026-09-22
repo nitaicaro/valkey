@@ -17,8 +17,6 @@ typedef struct {
     int err_code;
     mutexQueue *foreground_queue;
     bool terminated;
-    sds temp_file;
-    sds final_file;
     int write_target;
     union {
         struct {
@@ -145,10 +143,7 @@ static int writeReplicationData(forklessSaveInfo *saveInfo, bgIteratorItem *item
  *  - The RDB header has been written (magic, aux fields, functions)
  *  - The DB size hints have been written
  * This function is responsible for writing all of the dictionary entries. 
- * Additionally:
- *  - For file-based: flush/close/rename of the output file
- *  - For socket-based: transition from COB to socket IO
- * */
+ */
 static void *forklessSaveProcessor(void *arg) {
     serverAssert(!onServerMainThread());
     forklessSaveInfo *saveInfo = arg;
@@ -203,12 +198,12 @@ static void *forklessSaveProcessor(void *arg) {
             initStaticStringObject(key, objectGetKey(item->u.dbe.de));
             robj *o = item->u.dbe.de;
 
-                long long expire = objectGetExpire(item->u.dbe.de);
-                if (rdbSaveKeyValuePair(&saveInfo->save_rio, &key, o, expire, item->dbid, RDB_VERSION) == -1) {
-                    serverLog(LL_WARNING, "forkless-save: error writing KV pair");
-                    err = C_ERR;
-                }
-                break;
+            long long expire = objectGetExpire(item->u.dbe.de);
+            if (rdbSaveKeyValuePair(&saveInfo->save_rio, &key, o, expire, item->dbid, RDB_VERSION) == -1) {
+                serverLog(LL_WARNING, "forkless-save: error writing KV pair");
+                err = C_ERR;
+            }
+            break;
 
             case BGITERATOR_ITEM_REPLICATION:
                 serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
@@ -217,10 +212,14 @@ static void *forklessSaveProcessor(void *arg) {
                 break;
 
             case BGITERATOR_ITEM_SWAPDB:
+                /* Should only get SWAPDB for inconsistent (replication) iteration. */
+                serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
                 /* Iterator tracks swapdb internally; no special action needed. */
                 break;
 
             case BGITERATOR_ITEM_FLUSHDB:
+                /* Should only get FLUSHDB for inconsistent (replication) iteration. */
+                serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
                 /* Flush command will be replicated via the replication stream. */
                 break;
             
@@ -423,7 +422,16 @@ static void waitForBuffersToDrain(forklessSaveInfo *saveInfo) {
     handleClosingClients(saveInfo);
 }
 
-/* This function waits until all of the COBs have drained and transitions RIO to a CONNSET.
+/* Waits until all of the COBs have drained and transitions the RIO to a CONNSET.
+ *
+ * Two reasons for the transition:
+ *   1. The COB send path is driven by the main-thread event loop, so it can't be
+ *      used from the background save thread. There is also no need to: the bg
+ *      thread's only job is to stream the DB, so it is fine with blocking writes
+ *      straight to the sockets.
+ *   2. We may be streaming to more than one replica at once, so we transition to
+ *      a CONNSET (connection set) to abstract writing the same bytes to N sockets.
+ *
  * Returns:  C_OK - successful transition, saveInfo->save_rio is now a CONNSET
  *           C_ERR - failure, saveInfo->save_rio is still ReplicaCOB
  */
@@ -431,6 +439,8 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
     serverAssert(!onServerMainThread());
     serverAssert(saveInfo->write_target == RDB_WRITE_TARGET_SOCKET);
 
+    /* Drain the existing COB data before switching (e.g. the +FULLRESYNC handshake
+     * reply already queued on the socket) so the RDB stream stays in order. */
     waitForBuffersToDrain(saveInfo);
 
     listNode *ln;
@@ -440,7 +450,7 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
     listRewind(saveInfo->u.repl.clients, &li);
     while ((ln = listNext(&li)) != NULL) {
         client *c = listNodeValue(ln);
-        if (connBlock(c->conn) == C_ERR) {
+        if (connSetBlocking(c->conn, true) == C_ERR) {
             serverLog(LL_WARNING, "forkless-save: unable to set blocking on client(%llu)", (unsigned long long)c->id);
             abandonClient(saveInfo, c);
         }
