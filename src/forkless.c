@@ -529,7 +529,9 @@ static void cleanupSaveInfoAndEmitEndMetrics(forklessSaveInfo *saveInfo) {
 
     /* A cancel must not count as a failed save, so skip the metrics that set
      * lastbgsave_status (like the fork child's SIGUSR1 whitelist). */
-    if (!cancelled) rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, saveInfo->err_code, time(NULL));
+    if (!cancelled && saveInfo->write_target == RDB_WRITE_TARGET_DISK) {
+        rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, saveInfo->err_code, time(NULL));
+    }
     /* startSaving() fired the persistence start event in this process, so a
      * terminal event must be emitted even on cancel to balance it. */
     stopSaving(success);
@@ -835,7 +837,9 @@ static void startBackgroundThread(forklessSaveInfo *saveInfo) {
 
 static void forklessMarkSaveFailed(forklessSaveInfo *saveInfo) {
     saveInfo->err_code = C_ERR;
-    rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, C_ERR, time(NULL));
+    if (saveInfo->write_target == RDB_WRITE_TARGET_DISK) {
+        rdbRecordEndMetrics(RDB_BGSAVE_TYPE_FORKLESS, C_ERR, time(NULL));
+    }
     rdbClearSaveState(time(NULL));
     stopSaving(0);
     currentForklessSave = NULL;
