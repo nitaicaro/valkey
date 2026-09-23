@@ -2419,9 +2419,6 @@ int freeClient(client *c) {
         if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
             c->flag.close_asap = 0;
             c->flag.close_after_reply = 0;
-            replicationCachePrimary(c);
-            return 0;
-            /* NITAI this was included threadsave sync 
             if (server.wait_for_psync_offset) {
                 serverLog(LL_NOTICE, "Not caching primary state because replica doesn't have correct replication offset for psync.");
                 server.wait_for_psync_offset = 0;
@@ -2429,7 +2426,6 @@ int freeClient(client *c) {
                 replicationCachePrimary(c);
                 return 0;
             }
-            */
         }
     }
 
@@ -3213,11 +3209,6 @@ static int writevToClient(client *c) {
             trackBufReferences(c->buf, buflen, c);
         }
         addBufferToReplyIOV(c->flag.buf_encoded, c->buf, buflen, &reply, &buf_metadata[bufcnt++]);
-    /* NITAI this was in threadsave sync 
-    if (c->bufpos > 0) {
-        ssize_t offset = lastblock ? c->bufpos : bufpos;
-        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, offset, &reply, &buf_metadata[bufcnt++]);
-    */
     }
 
     if (lastblock) {
@@ -4454,8 +4445,16 @@ void commandProcessed(client *c) {
          * replication stream, so reploff must strictly advance. A no-op
          * advance means qb_applied was not maintained for the command we
          * just processed (e.g. a command was backfilled into querybuf without
-         * updating qb_applied). */
-        serverAssert(c->repl_data->reploff > prev_offset);
+         * updating qb_applied).
+         *
+         * Exception: the REPLCONF psync-offset command sent by the primary at
+         * the end of a forkless (socket) full sync. It rebases the replica's
+         * offset onto the primary's (see the skip_psync_offset block below)
+         * rather than advancing it, so reploff does not strictly advance for
+         * that one command (and equals prev_offset when the primary offset is
+         * still zero). */
+        serverAssert((prev_offset == 0 && server.skip_psync_offset) ||
+                     c->repl_data->reploff > prev_offset);
     }
 
     /* If the client is replicated we need to compute the difference
