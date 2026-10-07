@@ -738,6 +738,9 @@ static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
 
     saveInfo->bytes_written = saveInfo->save_rio.processed_bytes;
 
+    /* Flush the RDB into the COB before allowing further replica writes to it. */
+    rioFlush(&saveInfo->save_rio);
+
     /* The COB is currently not sending. At this point, we set a STOP position after the end
      * marker and re-enable COB writes. */
     listRewind(saveInfo->u.repl.clients, &li);
@@ -755,7 +758,6 @@ static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
     fixReplicationOffset(saveInfo);
 
 done:
-    rioFlush(&saveInfo->save_rio); // Force from RIO buffer into COB
     rioFreeReplicaCOB(&saveInfo->save_rio);
     return ret;
 }
