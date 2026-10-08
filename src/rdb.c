@@ -3971,8 +3971,14 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             return RDB_FAILED;
         }
 
-        /* Handle inline replication commands embedded during forkless sync. */
+        /* Inline replication commands run on load, so only honor them in a
+         * live inband-repl stream; reject in any other load. */
         if (type == RDB_OPCODE_UPDATE) {
+            if (!(rdbflags & RDBFLAGS_INBAND_REPL)) {
+                serverLog(LL_WARNING, "Rejecting inline replication opcode %d in a non-replication RDB load",
+                          type);
+                return RDB_FAILED;
+            }
             robj **argv;
             int argc;
             if (parseRespHeaderFromReader(rdbRioReader, rdb, &argc) != RESP_PARSE_OK) goto eoferr;

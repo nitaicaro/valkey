@@ -2966,8 +2966,10 @@ int replicaLoadPrimaryRDBFromSocket(connection *conn, char *buf, char *eofmark, 
     if (replicationSupportSkipRDBChecksum(conn, 1, *usemark)) rdb.flags |= RIO_FLAG_SKIP_RDB_CHECKSUM;
     int loadingFailed = 0;
     rdbLoadingCtx loadingCtx = {.dbarray = dbarray, .functions_lib_ctx = functions_lib_ctx};
+    /* This is the live replication stream, the only load allowed to honor the
+     * inline-replication opcode, so mark it with RDBFLAGS_INBAND_REPL. */
+    int flags = RDBFLAGS_REPLICATION | RDBFLAGS_INBAND_REPL;
     /* If we aren't using the swapdb method, then we want to empty the data before loading the rdb */
-    int flags = RDBFLAGS_REPLICATION;
     if (server.repl_diskless_load != REPL_DISKLESS_LOAD_SWAPDB) flags |= RDBFLAGS_EMPTY_DATA;
     int retval = rdbLoadRioWithLoadingCtx(&rdb, flags, rsi, &loadingCtx, "primary replication stream");
     if (retval != RDB_OK) {
