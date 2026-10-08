@@ -2129,3 +2129,49 @@ start_server {tags {"repl needs:other-server external:skip"} overrides {forkless
         }
     }
 }
+
+# Live writes that arrive after the bg iterator has finished scanning the
+# keyspace, but before the replica has come online, are not captured by the
+# iterator and cannot yet be served from the shared replication buffer. They
+# must still reach the replica (via the dedicated save buffer) or they are lost
+# -- the offsets converge but the replica is missing keys.
+start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes bgsave-default-method forkless}} {
+    set primary [srv 0 client]
+    set primary_host [srv 0 host]
+    set primary_port [srv 0 port]
+    $primary config set repl-diskless-sync yes
+    $primary config set repl-diskless-sync-delay 0
+    $primary debug populate 800000
+    start_server {overrides {save {}}} {
+        set replica [srv 0 client]
+        test "Writes after bg iterator termination still reach the replica" {
+            # Heavy concurrent write load across the whole save, so writes keep
+            # arriving in the window between the iterator finishing its scan and
+            # the replica coming online -- when such writes are neither captured
+            # by the iterator nor yet served from the shared replication buffer.
+            # This load has proved heavy enough to reliably cause writes to land
+            # in that window.
+            set load1 [start_write_load $primary_host $primary_port 10]
+            set load2 [start_write_load $primary_host $primary_port 10]
+            set load3 [start_write_load $primary_host $primary_port 10]
+            set load4 [start_write_load $primary_host $primary_port 10]
+            after 200
+            $replica replicaof $primary_host $primary_port
+            wait_for_condition 500 100 {
+                [s 0 master_link_status] eq {up}
+            } else {
+                fail "Replica didn't sync"
+            }
+            # Keep the load running a little past sync completion to cover the
+            # iterator-done -> replica-online handoff, then settle.
+            after 2000
+            stop_write_load $load1
+            stop_write_load $load2
+            stop_write_load $load3
+            stop_write_load $load4
+            wait_for_ofs_sync $primary $replica
+            assert_equal [$primary dbsize] [$replica dbsize]
+            assert_equal [$primary debug digest] [$replica debug digest]
+        }
+    }
+}

@@ -888,6 +888,9 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
         decrRefCount(selectcmd);
 
         server.replicas_eldb = dictid;
+
+        /* Mirror the SELECT into any forkless-save replica COB, in RDB format */
+        forklessAddRdbSelectToReplicaCob(dictid);
     }
 
     /* Build the RESP frame for this command in a staging buffer, then push it
@@ -928,6 +931,10 @@ void replicationFeedReplicas(int dictid, robj **argv, int argc) {
     }
     feedReplicationBuffer(frame, sdslen(frame));
     sdsfree(frame);
+
+    /* Mirror this command into any forkless-save replica COB, in RDB-inline
+     * format. */
+    forklessAddReplicationCommandToReplicaCob(argc, argv);
 }
 
 /* This is a debugging function that gets called when we detect something
@@ -1408,6 +1415,12 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
     }
     if (server.debug_pause_after_fork) debugPauseProcess();
 
+    /* The save started successfully; force the next replicated command to
+     * re-emit a SELECT so the live stream that follows the RDB (whether mirrored
+     * into the save COB or served from the shared backlog) is DB-framed and the
+     * replica does not desync. */
+    server.replicas_eldb = -1;
+
     /* Remember that dump.rdb was generated for replication so that we can later
      * delete the file if needed. Note that we don't set the flag if the feature is
      * disabled, otherwise it would never be cleared: the file is not deleted. This
@@ -1875,7 +1888,7 @@ void replconfCommand(client *c) {
             if (server.child_type == CHILD_TYPE_RDB && c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END)
                 checkChildrenDone();
             if (c->repl_data->repl_start_cmd_stream_on_ack && c->repl_data->repl_state == REPLICA_STATE_ONLINE) {
-                resumeReplicaWrites(c);
+                resumeReplicaCobFlush(c);
                 replicaStartCommandStream(c);
             }
             if (c->repl_data->repl_state == REPLICA_STATE_BG_RDB_LOAD) {
@@ -2004,10 +2017,11 @@ void replconfCommand(client *c) {
     addReply(c, shared.ok);
 }
 
-/* Suspend sending data to a replica until we receive a REPLCONF ACK.
- * Used by forkless-save-to-socket: after the RDB+EOF is queued in the COB,
- * we pause sending so the replica sees a clean EOF boundary. */
-void suspendReplicaWritesUntilAck(client *replica) {
+/* Suspend flushing a replica's COB to its socket until we receive a REPLCONF
+ * ACK. Appends into the COB still accumulate; only the send is held. Used by
+ * forkless-save-to-socket: after the RDB+EOF is queued in the COB, we hold the
+ * flush so the replica sees a clean EOF boundary before any trailing data. */
+void suspendReplicaCobFlushUntilAck(client *replica) {
     serverAssert(getClientType(replica) == CLIENT_TYPE_REPLICA);
     replica->repl_data->stop_send_data_until_ack = 1;
 
@@ -2018,7 +2032,7 @@ void suspendReplicaWritesUntilAck(client *replica) {
 }
 
 /* Resume sending data to a replica after ACK received. */
-void resumeReplicaWrites(client *replica) {
+void resumeReplicaCobFlush(client *replica) {
     serverAssert(getClientType(replica) == CLIENT_TYPE_REPLICA);
     if (!replica->repl_data->stop_send_data_until_ack) return;
     replica->repl_data->stop_send_data_until_ack = 0;
@@ -2037,7 +2051,7 @@ void resumeReplicaWrites(client *replica) {
  * the return value indicates that the replica should be disconnected.
  * */
 int replicaPutOnline(client *replica) {
-    resumeReplicaWrites(replica);
+    resumeReplicaCobFlush(replica);
     if (replica->flag.repl_rdbonly) {
         replica->repl_data->repl_state = REPLICA_STATE_RDB_TRANSMITTED;
         /* The client asked for RDB only so we should close it ASAP */

@@ -3210,7 +3210,7 @@ static int writevToClient(client *c) {
     size_t bufpos = 0;
     listNode *lastblock;
     if (inMainThread()) {
-        getClientWritePosition(c, &lastblock, &bufpos);
+        computeCobFlushStopPosition(c, &lastblock, &bufpos);
     } else {
         lastblock = c->io_last_reply_block;
         bufpos = lastblock ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -3242,11 +3242,19 @@ static int writevToClient(client *c) {
             clientReplyBlock *o = listNodeValue(next);
 
             size_t used = o->used;
-            /* Use c->io_last_bufpos as the currently used portion of the block.
-             * We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
-             * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
-             * that may not yet be visible to the current thread*/
-            if (!inMainThread() && next == lastblock) used = c->io_last_bufpos;
+            if (next == lastblock) {
+                if (inMainThread()) {
+                    /* Trust the computed stop position: the full block end for
+                     * a normal flush, or the capped point for a partial one. */
+                    used = bufpos;
+                } else {
+                    /* Use c->io_last_bufpos as the currently used portion of the block.
+                     * We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
+                     * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
+                     * that may not yet be visible to the current thread*/
+                    used = c->io_last_bufpos;
+                }
+            }
 
             if (used == 0) { /* empty node, skip over it. */
                 if (next == lastblock) break;
@@ -3314,8 +3322,7 @@ int _writeToClient(client *c) {
     size_t bufpos;
 
     if (inMainThread()) {
-        /* In the main thread, access bufpos and lastblock directly. */
-        getClientWritePosition(c, &lastblock, &bufpos);
+        computeCobFlushStopPosition(c, &lastblock, &bufpos);
     } else {
         /* If there is a last block, use bufpos directly; otherwise, use io_last_bufpos */
         bufpos = c->io_last_reply_block ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -3513,15 +3520,18 @@ static void _postWriteToClient(client *c) {
     }
 }
 
-/* Returns (via out-params) the write bufpos until which we can write.
+/* Compute how far a client's COB (static c->buf plus the c->reply overflow
+ * blocks) should be written out in the current flush, via out-params:
+ *   *block  -> the last reply block to include, or NULL if the reply list is
+ *              empty (everything to send is still in c->buf).
+ *   *bufpos -> how many bytes to send: an offset into c->buf when *block is
+ *              NULL, otherwise the byte count within that last block.
  *
- * - If the reply list is empty, the `bufpos` is set to an offset in c->buf.
- * - Otherwise, set bufpos is an offset in the last reply block
- *
- * Also, set 'block' to:
- * - The last reply block if it exists
- * - NULL if the reply list is empty */
-void getClientWritePosition(client *c, listNode **block, size_t *bufpos) {
+ * Usually this is the real end of the COB (the whole COB is ready to go out).
+ * For a forkless save-to-socket replica a COB pause point caps it right after
+ * the RDB end marker (see suspendReplicaCobFlushUntilAck) so post-marker
+ * replication mirrored into the COB is withheld until the replica ACKs. */
+void computeCobFlushStopPosition(client *c, listNode **block, size_t *bufpos) {
     if (c->repl_data && c->repl_data->cob_pause_bufpos > 0) {
         *block = NULL;
         *bufpos = c->repl_data->cob_pause_bufpos;
@@ -3609,7 +3619,7 @@ int postWriteToClient(client *c) {
 
         if (sentRdbCOB) {
             if (connHasWriteHandler(c->conn)) connSetWriteHandler(c->conn, NULL);
-            suspendReplicaWritesUntilAck(c);
+            suspendReplicaCobFlushUntilAck(c);
             serverLog(LL_NOTICE, "Halting COB writes; waiting for ACK.  Client(%llu)",
                       (unsigned long long)c->id);
         }
