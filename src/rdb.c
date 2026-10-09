@@ -3902,6 +3902,33 @@ int loadCommandFromArgv(client *fakeClient, robj **argv, int argc, int *is_multi
     return C_OK;
 }
 
+/* SWAPDB replayed during a swapdb-mode diskless load must be applied to the
+ * databases being loaded, not the live server.db, so swap their data fields
+ * directly here. Returns 1 if this was a swapdb-mode SWAPDB and has been handled
+ * (argv is freed), or 0 otherwise (not swapdb mode or not a SWAPDB; the caller
+ * should replay argv normally and argv is left untouched). */
+static int tryHandleInlineSwapdbForTempLoad(rdbLoadingCtx *rdb_loading_ctx, robj **argv, int argc) {
+    /* Validate we are in swapdb mode: only that mode loads into a temporary
+     * database array (dbarray) distinct from the live server.db. */
+    if (rdb_loading_ctx->dbarray == server.db) return 0;
+
+    struct serverCommand *cmd = lookupCommand(argv, argc);
+    if (cmd->proc != swapdbCommand) return 0;
+
+    /* getParamsForSwapdb validates arity/range and returns false for a no-op
+     * (e.g. "swapdb 0 0"); in that case there is nothing to swap. */
+    int id1, id2;
+    if (getParamsForSwapdb(argc, argv, NULL, &id1, &id2)) {
+        if (rdb_loading_ctx->dbarray[id1] == NULL) rdb_loading_ctx->dbarray[id1] = createDatabase(id1);
+        if (rdb_loading_ctx->dbarray[id2] == NULL) rdb_loading_ctx->dbarray[id2] = createDatabase(id2);
+        dbSwapDataFields(rdb_loading_ctx->dbarray[id1], rdb_loading_ctx->dbarray[id2]);
+    }
+
+    for (int k = 0; k < argc; k++) decrRefCount(argv[k]);
+    zfree(argv);
+    return 1;
+}
+
 /* Load an RDB file from the rio stream 'rdb'. We return one of the following:
  * - RDB_OK On success
  * - RDB_INCOMPATIBLE If the RDB has an invalid signature or version
@@ -3983,6 +4010,10 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
             int argc;
             if (parseRespHeaderFromReader(rdbRioReader, rdb, &argc) != RESP_PARSE_OK) goto eoferr;
             if (parseRespArgsFromReader(rdbRioReader, rdb, argc, &argv) != RESP_PARSE_OK) goto eoferr;
+
+            /* Edge case: SWAPDB during a swapdb-mode load must be handled
+             * separately and not through the fake client. */
+            if (tryHandleInlineSwapdbForTempLoad(rdb_loading_ctx, argv, argc)) continue;
 
             /* Create the fake client the first time we see an inline command,
              * then reuse it. Most loads have no inline commands, so we avoid

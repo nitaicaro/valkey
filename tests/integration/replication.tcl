@@ -2175,3 +2175,53 @@ start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastruc
         }
     }
 }
+
+
+# A SWAPDB issued on the primary while a forkless full sync is in progress is
+# carried to the replica as an inline command in the RDB stream. It must land
+# on the databases being loaded. In swapdb-mode diskless load those are a
+# temporary array (not the live server.db), which is the case that previously
+# applied the swap to the wrong databases. Exercise every replica-side load
+# mode, under both a socket (diskless) and a disk-based primary save.
+foreach primary_diskless {yes no} {
+    foreach replica_load {disabled on-empty-db swapdb} {
+        start_server {overrides {save {} forkless-infrastructure-enabled yes bgsave-default-method forkless}} {
+            set primary [srv 0 client]
+            set ph [srv 0 host]
+            set pp [srv 0 port]
+            $primary config set repl-diskless-sync $primary_diskless
+            $primary config set repl-diskless-sync-delay 0
+            # Distinct data in db0 and db1 so a wrong swap changes the digest.
+            $primary select 1
+            for {set i 0} {$i < 500} {incr i} { $primary set db1:$i $i }
+            $primary select 0
+            $primary debug populate 200000
+
+            start_server {overrides {save {}}} {
+                set replica [srv 0 client]
+                $replica config set repl-diskless-load $replica_load
+
+                test "SWAPDB during forkless sync replays correctly (primary diskless=$primary_diskless, replica load=$replica_load)" {
+                    set load1 [start_write_load $ph $pp 8]
+                    set load2 [start_write_load $ph $pp 8]
+                    after 150
+                    $replica replicaof $ph $pp
+                    # Issue the SWAPDB while the sync is in flight.
+                    after 100
+                    catch {$primary swapdb 0 1}
+                    wait_for_condition 500 100 {
+                        [s 0 master_link_status] eq {up}
+                    } else {
+                        fail "Replica didn't sync"
+                    }
+                    after 800
+                    stop_write_load $load1
+                    stop_write_load $load2
+                    wait_for_ofs_sync $primary $replica
+                    assert_equal [$primary debug digest] [$replica debug digest]
+                }
+            }
+        }
+    }
+}
+
