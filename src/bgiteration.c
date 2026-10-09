@@ -22,10 +22,23 @@ static bool isScriptCallWriteCmd(struct serverCommand *cmd) {
     return ((cmd->proc == fcallCommand) || (cmd->proc == evalCommand) || (cmd->proc == evalShaCommand));
 }
 
+/* Some read commands also change the internal format (not great).  We need to treat these like
+ * write commands, blocking them from modifying the format while the background thread might be
+ * operating on the item.
+ *  - PFCOUNT - modifies the underlying string (and is replicated!)
+ *  - LINDEX/LRANGE/LPOS - may modify quicklist by LZF compress/uncompress */
+static bool isFormatChangingCommand(struct serverCommand *cmd) {
+    return ((cmd->proc == pfcountCommand) ||
+            (cmd->proc == lindexCommand) ||
+            (cmd->proc == lrangeCommand) ||
+            (cmd->proc == lposCommand) ||
+            (cmd->proc == sortroCommand));
+}
+
 /* The PFCOUNT command (which does NOT have the CMD_WRITE flag) modifies the underlying string and
  * is replicated as a write.  So it needs to be detected and handled specially. */
 static bool isWriteCmd(struct serverCommand *cmd) {
-    return ((cmd->flags & CMD_WRITE) || (cmd->proc == pfcountCommand) || (cmd->proc == execCommand) || (isScriptCallWriteCmd(cmd)));
+    return ((cmd->flags & CMD_WRITE) || isFormatChangingCommand(cmd) || (cmd->proc == execCommand) || (isScriptCallWriteCmd(cmd)));
 }
 
 // Returns true if the command is a deletion based command (DEL or UNLINK)
@@ -80,37 +93,6 @@ static bool getTargetDbIdForCopyCommand(int argc, robj **argv, int selected_dbid
     return true;
 }
 
-/* Get parameters for the SWAPDB command.
- * The optional permission_client allows for checking of a client's permission for swapdb.
- * Returns true if command would be executed. */
-static bool getParamsForSwapdb(int argc, robj **argv, client *permission_client, int *id1_p, int *id2_p) {
-    static struct serverCommand *swapdb_cmd = NULL;
-
-    // We don't need to check permissions in the replication phase
-    if (permission_client != NULL) {
-        if (swapdb_cmd == NULL) {
-            swapdb_cmd = lookupCommandByCString("swapdb");
-            serverAssert(swapdb_cmd != NULL);
-        }
-
-        int idxptr;
-        if (ACLCheckAllUserCommandPerm(permission_client->user, swapdb_cmd, argv, argc,
-                                       permission_client->db->id, &idxptr) != ACL_OK) return false;
-    }
-
-    long long dbid1, dbid2;
-    if (argc != 3) return false;
-    if (server.cluster_enabled) return false;
-    if (getLongLongFromObject(argv[1], &dbid1) != C_OK) return false;
-    if (getLongLongFromObject(argv[2], &dbid2) != C_OK) return false;
-    if (dbid1 < 0 || dbid1 >= server.dbnum) return false;
-    if (dbid2 < 0 || dbid2 >= server.dbnum) return false;
-    if (dbid1 == dbid2) return false; // Valid, but doesn't do anything
-
-    *id1_p = (int)dbid1;
-    *id2_p = (int)dbid2;
-    return true;
-}
 
 /* Get parameters for the SELECT command.
  * The optional permission_client allows for checking of a client's permission for select.
@@ -1879,6 +1861,7 @@ static bool anIteratorWillReplicateForThisCommand(void) {
 
 static bool expediteKeysForMultiExec(client *c, hashtable *waitingOnKeys) {
     serverAssert(c->cmd->proc == execCommand);
+    if (c->mstate == NULL) return false; // EXEC without MULTI
 
     /* For MULTI/EXEC, Valkey buffers all of the commands until hitting the EXEC.
      * At this point, the client holds all of the commands to be executed.  This function searches
