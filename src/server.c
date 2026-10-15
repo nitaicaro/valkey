@@ -1716,7 +1716,14 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
                 (server.unixtime - server.lastbgsave_try > CONFIG_BGSAVE_RETRY_DELAY ||
                  server.lastbgsave_status == C_OK)) {
                 serverLog(LL_NOTICE, "%d changes in %d seconds. Saving...", sp->changes, (int)sp->seconds);
-                rdbStartBgsave(resolveBgsaveType());
+                const char *skip_reason = NULL;
+                int save_type = resolveBgsaveType(&skip_reason);
+                if (save_type == RDB_BGSAVE_TYPE_NONE) {
+                    serverLog(LL_WARNING, "Skipping scheduled save: %s; will retry later", skip_reason);
+                    server.lastbgsave_try = server.unixtime;
+                } else {
+                    rdbStartBgsave(save_type);
+                }
                 break;
             }
         }
@@ -1788,6 +1795,13 @@ long long serverCron(struct aeEventLoop *eventLoop, long long id, void *clientDa
      * executed changes the value via CONFIG SET, the server will perform
      * the operation even if completely idle. */
     if (server.tracking_clients) trackingLimitUsedSlots();
+
+    /* Reclaim dead client IDs from the tracking table. NOT gated on
+     * server.tracking_clients: dead IDs can linger in inner RAXes after every
+     * tracking client has disconnected, so tracking_clients may be zero while
+     * stale items remain. The sweep schedules itself on an adaptive period
+     * and time-budgets each step, so calling it every tick is cheap. */
+    trackingSweepDeadClients();
 
     /* Start a scheduled BGSAVE if the corresponding flag is set. This is
      * useful when we are forced to postpone a BGSAVE because an AOF
@@ -5328,6 +5342,9 @@ int finishShutdown(void) {
 
     moduleUnloadAllModules();
 
+    /* Module unloading may drain IO queues, so stop workers afterward. */
+    killIOThreads();
+
     serverLog(LL_WARNING, "%s is now ready to exit, bye bye...", server.sentinel_mode ? "Sentinel" : "Valkey");
     return C_OK;
 
@@ -6456,6 +6473,7 @@ void totalNumberOfStatefulKeys(unsigned long *blocking_keys,
  * on memory corruption problems. */
 sds genValkeyInfoString(dict *section_dict, int all_sections, int everything) {
     sds info = sdsempty();
+    info = sdsMakeRoomFor(info, 4096);
     time_t uptime = server.unixtime - server.stat_starttime;
     int j;
     int sections = 0;
