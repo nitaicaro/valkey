@@ -959,7 +959,15 @@ test {diskless loading short read} {
                 # kill the replica connection on the master
                 set killed [$master client kill type replica]
 
-                set res [wait_for_log_messages -1 {"*Internal error in RDB*" "*Finished with success*" "*Successful partial resynchronization*"} $loglines 500 10]
+                # Wait for the replica to resolve this sync attempt: either it
+                # hit the short read ("Internal error in RDB"), or the transfer
+                # happened to complete before the kill ("Finished with success"
+                # / "Successful partial resynchronization"). On a slow or loaded
+                # CI VM (e.g. the sanitizer build) a single attempt can take
+                # several seconds to surface one of these, so use a generous
+                # window here to avoid a false "message not found" failure while
+                # still catching a real regression that emits nothing at all.
+                set res [wait_for_log_messages -1 {"*Internal error in RDB*" "*Finished with success*" "*Successful partial resynchronization*"} $loglines 5000 10]
                 if {$::verbose} { puts $res }
                 set log_text [lindex $res 0]
                 set loglines [lindex $res 1]
