@@ -1448,17 +1448,26 @@ sds genAofTimestampAnnotationIfNeeded(int force) {
  *          to avoid writing `select` command in any case.
  * argv   - The command to write to the aof.
  * argc   - Number of values in argv
+ *
+ * If AOF is not actively writing (i.e. not AOF_ON, and not in an active
+ * rewrite), this function returns immediately without side effects.
  */
 void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
-    sds buf = sdsempty();
-
     serverAssert(dictid == -1 || (dictid >= 0 && dictid < server.dbnum));
+
+    /* The caller (propagateNow) only checks AOF_OFF. We additionally skip
+     * AOF_WAIT_REWRITE without an active rewrite child, since aof_buf
+     * data has nowhere to be merged from in that transient state. */
+    if (!(server.aof_state == AOF_ON ||
+          (server.aof_state == AOF_WAIT_REWRITE && server.child_type == CHILD_TYPE_AOF))) {
+        return;
+    }
 
     /* Feed timestamp if needed */
     if (server.aof_timestamp_enabled) {
         sds ts = genAofTimestampAnnotationIfNeeded(0);
         if (ts != NULL) {
-            buf = sdscatsds(buf, ts);
+            server.aof_buf = sdscatsds(server.aof_buf, ts);
             sdsfree(ts);
         }
     }
@@ -1469,22 +1478,14 @@ void feedAppendOnlyFile(int dictid, robj **argv, int argc) {
         char seldb[64];
 
         snprintf(seldb, sizeof(seldb), "%d", dictid);
-        buf = sdscatprintf(buf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n", (unsigned long)strlen(seldb), seldb);
+        server.aof_buf =
+            sdscatprintf(server.aof_buf, "*2\r\n$6\r\nSELECT\r\n$%lu\r\n%s\r\n", (unsigned long)strlen(seldb), seldb);
         server.aof_selected_db = dictid;
     }
 
     /* All commands should be propagated the same way in AOF as in replication.
      * No need for AOF-specific translation. */
-    buf = catAppendOnlyGenericCommand(buf, argc, argv);
-
-    /* Append to the AOF buffer. This will be flushed on disk just before
-     * of re-entering the event loop, so before the client will get a
-     * positive reply about the operation performed. */
-    if (server.aof_state == AOF_ON || (server.aof_state == AOF_WAIT_REWRITE && server.child_type == CHILD_TYPE_AOF)) {
-        server.aof_buf = sdscatlen(server.aof_buf, buf, sdslen(buf));
-    }
-
-    sdsfree(buf);
+    server.aof_buf = catAppendOnlyGenericCommand(server.aof_buf, argc, argv);
 }
 
 /* ----------------------------------------------------------------------------
@@ -1521,6 +1522,76 @@ struct client *createAOFClient(void) {
     initClientReplicationData(c);
     c->repl_data->repl_state = REPLICA_STATE_WAIT_BGSAVE_START;
     return c;
+}
+
+/* Adapts fread to the read_fn signature used by parseRespArgsFromReader. */
+static size_t aofFileReader(void *ctx, void *buf, size_t len) {
+    return fread(buf, len, 1, (FILE *)ctx) == 1 ? len : 0;
+}
+
+/* Run one command that has already been parsed into argv/argc, using a fake
+ * client. This is used when we replay commands while loading data. The fake
+ * client sends no reply and is never allowed to block.
+ *
+ * The fake client takes over argv. When this function returns, argv has
+ * already been freed (running the command can change argv, so we free the
+ * client's own argv, not the pointer that was passed in).
+ *
+ * Returns LOAD_CMD_OK if the command ran, or LOAD_CMD_MULTI_START if it ran and
+ * was a MULTI. Returns LOAD_CMD_ERR_UNKNOWN if the command name is not known, or
+ * LOAD_CMD_ERR if the number of arguments is wrong. In the error cases *err is
+ * set to a short message that the caller must free.
+ *
+ * When ignore_multi_exec is non-zero the caller is replaying individual
+ * commands, so MULTI/EXEC are skipped rather than queued into a transaction. */
+loadCommandResult loadCommandFromArgv(client *fakeClient, robj **argv, int argc, int ignore_multi_exec, sds *err) {
+    struct serverCommand *cmd;
+
+    fakeClient->argc = argc;
+    fakeClient->argv = argv;
+    fakeClient->argv_len = argc;
+
+    fakeClient->cmd = fakeClient->lastcmd = cmd = lookupCommand(argv, argc);
+    if ((!cmd && !commandCheckExistence(fakeClient, err)) || (cmd && !commandCheckArity(cmd, argc, err))) {
+        /* An unknown command's error text can echo user data; an arity error
+         * cannot. Report them distinctly so the caller can redact. */
+        loadCommandResult res = (cmd == NULL) ? LOAD_CMD_ERR_UNKNOWN : LOAD_CMD_ERR;
+        freeClientArgv(fakeClient);
+        return res;
+    }
+
+    /* A caller replaying individual commands skips MULTI/EXEC framing so each
+     * command applies immediately instead of being queued into a transaction. */
+    if (ignore_multi_exec && (cmd->proc == multiCommand || cmd->proc == execCommand)) {
+        serverLog(LL_DEBUG, "Skipping %s command while replaying individual commands", cmd->fullname);
+        freeClientArgv(fakeClient);
+        return LOAD_CMD_OK;
+    }
+
+    /* Note whether this command is a MULTI before running it, so the caller
+     * replaying an AOF can track transaction boundaries. */
+    loadCommandResult res = (cmd->proc == multiCommand) ? LOAD_CMD_MULTI_START : LOAD_CMD_OK;
+
+    /* Run the command in the context of a fake client */
+    if (fakeClient->flag.multi && fakeClient->cmd->proc != execCommand) {
+        /* Note: we don't have to attempt calling evalGetCommandFlags,
+         * since this is a replay, the checks in processCommand are not made
+         * anyway.*/
+        queueMultiCommand(fakeClient, cmd->flags);
+    } else {
+        cmd->proc(fakeClient);
+    }
+
+    /* The fake client should not have a reply */
+    serverAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
+
+    /* The fake client should never get blocked */
+    serverAssert(fakeClient->flag.blocked == 0);
+
+    /* Clean up. Command code may have changed argv/argc so we use the
+     * argv/argc of the client instead of the local variables. */
+    freeClientArgv(fakeClient);
+    return res;
 }
 
 /* Replay an append log file. On success AOF_OK or AOF_TRUNCATED is returned,
@@ -1570,11 +1641,12 @@ int loadSingleAppendOnlyFile(char *filename) {
     fakeClient = createAOFClient();
     server.current_client = server.executing_client = fakeClient;
 
-    /* Check if the AOF file is in RDB format (it may be RDB encoded base AOF
-     * or old style RDB-preamble AOF). In that case we need to load the RDB file
-     * and later continue loading the AOF tail if it is an old style RDB-preamble AOF. */
-    char sig[6]; /* "REDIS" or "VALKEY" */
-    if (fread(sig, 1, 6, fp) != 6 || (memcmp(sig, "REDIS0", 6) != 0 && memcmp(sig, "VALKEY", 6) != 0)) {
+    /* Check if the AOF starts with a plain or streaming-compressed RDB (it may
+     * be an RDB-encoded base AOF or old-style RDB-preamble AOF). In that case,
+     * load the RDB and then continue with any old-style AOF tail. */
+    char sig[6]; /* "REDIS0", "VALKEY", or the three-byte "VCS" prefix. */
+    size_t siglen = fread(sig, 1, sizeof(sig), fp);
+    if (!rdbHasFileSignature(sig, siglen)) {
         /* Not in RDB format, seek back at 0 offset. */
         if (fseek(fp, 0, SEEK_SET) == -1) goto readerr;
     } else {
@@ -1588,7 +1660,7 @@ int loadSingleAppendOnlyFile(char *filename) {
 
         if (fseek(fp, 0, SEEK_SET) == -1) goto readerr;
         rioInitWithFile(&rdb, fp);
-        if (rdbLoadRio(&rdb, RDBFLAGS_AOF_PREAMBLE, NULL) != RDB_OK) {
+        if (rdbLoadRio(&rdb, RDBFLAGS_AOF_PREAMBLE, NULL, aof_filepath) != RDB_OK) {
             if (old_style)
                 serverLog(LL_WARNING, "Error reading the RDB preamble of the AOF file %s, AOF loading aborted",
                           filename);
@@ -1598,6 +1670,8 @@ int loadSingleAppendOnlyFile(char *filename) {
             ret = AOF_FAILED;
             goto cleanup;
         } else {
+            /* rdbLoadRio() leaves fp at the first byte after the RDB, where an
+             * old-style AOF tail starts. */
             valid_up_to = ftello(fp);
             loadingAbsProgress(valid_up_to);
             last_progress_report_size = valid_up_to;
@@ -1607,12 +1681,9 @@ int loadSingleAppendOnlyFile(char *filename) {
 
     /* Read the actual AOF file, in REPL format, command by command. */
     while (1) {
-        int argc, j;
-        unsigned long len;
+        int argc;
         robj **argv;
         char buf[AOF_ANNOTATION_LINE_MAX_LEN];
-        sds argsds;
-        struct serverCommand *cmd;
 
         /* Serve the clients from time to time */
         if (!(loops++ % 1024)) {
@@ -1636,76 +1707,24 @@ int loadSingleAppendOnlyFile(char *filename) {
         if (argc < 1) goto fmterr;
         if ((size_t)argc > SIZE_MAX / sizeof(robj *)) goto fmterr;
 
-        /* Load the next command in the AOF as our fake client
-         * argv. */
-        argv = zmalloc(sizeof(robj *) * argc);
-        fakeClient->argc = argc;
-        fakeClient->argv = argv;
-        fakeClient->argv_len = argc;
+        /* Read the argument list into the fake client's argv. */
+        respParseResult pr = parseRespArgsFromReader(aofFileReader, fp, argc, &argv);
+        if (pr == RESP_PARSE_EOF) goto readerr;
+        if (pr == RESP_PARSE_FMTERR) goto fmterr;
 
-        for (j = 0; j < argc; j++) {
-            /* Parse the argument len. */
-            char *readres = fgets(buf, sizeof(buf), fp);
-            if (readres == NULL || buf[0] != '$') {
-                fakeClient->argc = j; /* Free up to j-1. */
-                freeClientArgv(fakeClient);
-                if (readres == NULL)
-                    goto readerr;
-                else
-                    goto fmterr;
-            }
-            len = strtol(buf + 1, NULL, 10);
-
-            /* Read it into a string object. */
-            argsds = sdsnewlen(SDS_NOINIT, len);
-            if (len && fread(argsds, len, 1, fp) == 0) {
-                sdsfree(argsds);
-                fakeClient->argc = j; /* Free up to j-1. */
-                freeClientArgv(fakeClient);
-                goto readerr;
-            }
-            argv[j] = createObject(OBJ_STRING, argsds);
-
-            /* Discard CRLF. */
-            if (fread(buf, 2, 1, fp) == 0) {
-                fakeClient->argc = j + 1; /* Free up to j. */
-                freeClientArgv(fakeClient);
-                goto readerr;
-            }
-        }
-
-        /* Command lookup */
+        /* Command lookup, validation and execution. Keep MULTI framing (0) so
+         * AOF transactions replay as transactions. */
         sds err = NULL;
-        fakeClient->cmd = fakeClient->lastcmd = cmd = lookupCommand(argv, argc);
-        if ((!cmd && !commandCheckExistence(fakeClient, &err)) || (cmd && !commandCheckArity(cmd, argc, &err))) {
-            serverLog(LL_WARNING, "Error reading the append only file %s, error: %s", filename, err);
+        loadCommandResult lr = loadCommandFromArgv(fakeClient, argv, argc, 0, &err);
+        if (lr == LOAD_CMD_ERR_UNKNOWN || lr == LOAD_CMD_ERR) {
+            serverLog(LL_WARNING, "Error reading the append only file %s, error: %s", filename,
+                      (server.hide_user_data_from_log && lr == LOAD_CMD_ERR_UNKNOWN) ? "*redacted*" : err);
             sdsfree(err);
-            freeClientArgv(fakeClient);
             ret = AOF_FAILED;
             goto cleanup;
         }
+        if (lr == LOAD_CMD_MULTI_START) valid_before_multi = valid_up_to;
 
-        if (cmd->proc == multiCommand) valid_before_multi = valid_up_to;
-
-        /* Run the command in the context of a fake client */
-        if (fakeClient->flag.multi && fakeClient->cmd->proc != execCommand) {
-            /* Note: we don't have to attempt calling evalGetCommandFlags,
-             * since this is AOF, the checks in processCommand are not made
-             * anyway.*/
-            queueMultiCommand(fakeClient, cmd->flags);
-        } else {
-            cmd->proc(fakeClient);
-        }
-
-        /* The fake client should not have a reply */
-        serverAssert(fakeClient->bufpos == 0 && listLength(fakeClient->reply) == 0);
-
-        /* The fake client should never get blocked */
-        serverAssert(fakeClient->flag.blocked == 0);
-
-        /* Clean up. Command code may have changed argv/argc so we use the
-         * argv/argc of the client instead of the local variables. */
-        freeClientArgv(fakeClient);
         if (server.aof_load_truncated) valid_up_to = ftello(fp);
         if (server.key_load_delay) debugDelay(server.key_load_delay);
     }
@@ -2557,7 +2576,9 @@ int rewriteAppendOnlyFile(char *filename) {
 
     if (server.aof_use_rdb_preamble) {
         int error;
-        if (rdbSaveRio(REPLICA_REQ_NONE, RDB_VERSION, &aof, &error, RDBFLAGS_AOF_PREAMBLE, NULL) == C_ERR) {
+        compressionAlgo compression_algo = rdbCompressionAlgorithm(server.rdb_compression);
+        if (rdbSaveRio(compression_algo, REPLICA_REQ_NONE, RDB_VERSION, &aof, &error,
+                       RDBFLAGS_AOF_PREAMBLE, NULL) == C_ERR) {
             errno = error;
             goto werr;
         }

@@ -470,12 +470,14 @@ typedef enum {
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM (1 << 3) /* Supports skipping RDB checksum for sync requests. */
 #define REPLICA_CAPA_LZ4 (1 << 4)               /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD (1 << 5)              /* Accepts Zstd streaming-compressed replication payloads. */
+#define REPLICA_CAPA_INBAND_REPL (1 << 6)       /* Supports RDB_OPCODE_UPDATE for inline replication. */
 #define REPLICA_CAPA_COMPRESSION_MASK (REPLICA_CAPA_LZ4 | REPLICA_CAPA_ZSTD)
 
 /* Replica capability strings */
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM_STR "skip-rdb-checksum" /* Supports skipping RDB checksum for sync requests. */
 #define REPLICA_CAPA_LZ4_STR "lz4"                             /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD_STR "zstd"                           /* Accepts Zstd streaming-compressed replication payloads. */
+#define REPLICA_CAPA_INBAND_REPL_STR "inband-repl"             /* Supports RDB_OPCODE_UPDATE for inline replication. */
 
 /* Replica requirements */
 #define REPLICA_REQ_NONE 0
@@ -696,6 +698,13 @@ typedef enum {
     RDB_BGSAVE_TYPE_FORKLESS = 2 /* Forkless bgsave. */
 } rdbBgsaveType;
 
+/* Policy for server.forkless_policy */
+typedef enum {
+    FORKLESS_POLICY_REQUIRE_FORK,     /* Always fork; never use forkless. */
+    FORKLESS_POLICY_REQUIRE_FORKLESS, /* Forkless only; fail rather than fork. */
+    FORKLESS_POLICY_PREFER_FORKLESS   /* Forkless, falling back to fork when it cannot be served. */
+} forklessPolicy;
+
 /* Replica failover policy for server.cluster_replica_no_failover. */
 typedef enum {
     CLUSTER_REPLICA_NO_FAILOVER_NO = 0,   /* Allow automatic failover (default). */
@@ -788,6 +797,10 @@ typedef enum {
 #define ARGS_SET_IFNE (1 << 13) /* Set only if values are not equal */
 #define ARGS_BYINT (1 << 14)    /* Set if the value needs to be incremented by an integer. */
 #define ARGS_BYFLOAT (1 << 15)  /* Set if the value needs to be incremented by a float. */
+#define ARGS_LBOUND (1 << 16)   /* Set if lower bound is specified. */
+#define ARGS_UBOUND (1 << 17)   /* Set if upper bound is specified. */
+#define ARGS_SATURATE (1 << 18) /* Set if saturation is enabled. */
+#define ARGS_ENX (1 << 19)      /* Set if expire only when no ttl exists. */
 
 #define ARGS_SET_CONDITIONAL \
     (ARGS_SET_NX | ARGS_SET_XX | ARGS_SET_IFEQ | ARGS_SET_IFNE)
@@ -992,6 +1005,7 @@ typedef struct functionsLibCtx functionsLibCtx;
 typedef struct rdbLoadingCtx {
     serverDb **dbarray;
     functionsLibCtx *functions_lib_ctx;
+    client *update_client; /* Fake client for executing inline replication commands during RDB load. */
 } rdbLoadingCtx;
 
 typedef sds (*rdbAuxFieldEncoder)(int flags);
@@ -1276,6 +1290,8 @@ typedef struct ClientFlags {
     uint64_t throttled : 1;                /* Currently queued in a throttler */
     uint64_t throttle_checked : 1;         /* Already passed throttle check for this command */
     uint64_t throttle_multi : 1;           /* Matches multiple throttlers */
+    uint64_t forkless_managed : 1;         /* Client is owned by forkless save. Written only on the
+                                            * main thread. The save thread only reads it */
 } ClientFlags;
 /* Ensure ClientFlags never silently grows beyond two uint64_t words.
  * If this fires, move a flag to a separate field or widen the limit. */
@@ -1317,36 +1333,45 @@ typedef struct replicaCompressionState {
 } replicaCompressionState;
 
 typedef struct ClientReplicationData {
-    int repl_state;                      /* Replication state if this is a replica. */
-    int repl_start_cmd_stream_on_ack;    /* Install replica write handler on first ACK. */
-    int repldbfd;                        /* Replication DB file descriptor. */
-    off_t repldboff;                     /* Replication DB file offset. */
-    off_t repldbsize;                    /* Replication DB file size. */
-    sds replpreamble;                    /* Replication DB preamble. */
-    long long read_reploff;              /* Read replication offset if this is a primary. */
-    long long reploff;                   /* Applied replication offset if this is a primary. */
-    long long repl_applied;              /* Applied replication data count in querybuf, if this is a replica. */
-    long long repl_ack_off;              /* Replication ack offset, if this is a replica. */
-    long long repl_aof_off;              /* Replication AOF fsync ack offset, if this is a replica. */
-    long long repl_ack_time;             /* Replication ack time, if this is a replica. */
-    long long repl_last_partial_write;   /* The last time the server did a partial write from the RDB child pipe to this
-                                            replica  */
-    long long psync_initial_offset;      /* FULLRESYNC reply offset other replicas
-                                            copying this replica output buffer
-                                            should use. */
-    char replid[CONFIG_RUN_ID_SIZE + 1]; /* primary replication ID (if primary). */
-    int replica_listening_port;          /* As configured with: REPLCONF listening-port */
-    char *replica_addr;                  /* Optionally given by REPLCONF ip-address */
-    int replica_version;                 /* Version on the form 0xMMmmpp. */
-    short replica_capa;                  /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
-    short replica_req;                   /* Replica requirements: REPLICA_REQ_* */
-    uint64_t associated_rdb_client_id;   /* The client id of this replica's rdb connection */
-    time_t rdb_client_disconnect_time;   /* Time of the first freeClient call on this client. Used for delaying free. */
-    listNode *ref_repl_buf_node;         /* Referenced node of replication buffer blocks,
-                                           see the definition of replBufBlock. */
-    size_t ref_block_pos;                /* Access position of referenced buffer block,
-                                           i.e. the next offset to send. */
-    sds replica_nodeid;                  /* Node id in cluster mode. */
+    int repl_state;                        /* Replication state if this is a replica. */
+    int repl_start_cmd_stream_on_ack;      /* Install replica write handler on first ACK. */
+    int repldbfd;                          /* Replication DB file descriptor. */
+    off_t repldboff;                       /* Replication DB file offset. */
+    off_t repldbsize;                      /* Replication DB file size. */
+    sds replpreamble;                      /* Replication DB preamble. */
+    long long read_reploff;                /* Read replication offset if this is a primary. */
+    long long reploff;                     /* Applied replication offset if this is a primary. */
+    long long repl_applied;                /* Applied replication data count in querybuf, if this is a replica. */
+    int repl_applied_dbid;                 /* DB selected at repl_applied in the stream, if this is a slot import. */
+    long long repl_ack_off;                /* Replication ack offset, if this is a replica. */
+    long long repl_aof_off;                /* Replication AOF fsync ack offset, if this is a replica. */
+    long long repl_ack_time;               /* Replication ack time, if this is a replica. */
+    long long repl_last_partial_write;     /* The last time the server did a partial write from the RDB child pipe to this
+                                              replica  */
+    long long psync_initial_offset;        /* FULLRESYNC reply offset other replicas
+                                              copying this replica output buffer
+                                              should use. */
+    char replid[CONFIG_RUN_ID_SIZE + 1];   /* primary replication ID (if primary). */
+    int replica_listening_port;            /* As configured with: REPLCONF listening-port */
+    char *replica_addr;                    /* Optionally given by REPLCONF ip-address */
+    int replica_version;                   /* Version on the form 0xMMmmpp. */
+    unsigned long long tot_rdb_bytes_sent; /* Total RDB bytes sent to replica sockets. */
+    short replica_capa;                    /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
+    int stop_send_data_until_ack;          /* Stop sending data to this replica until ACK received. */
+    int using_cob;                         /* Networking uses private COB instead of shared repl buffer. */
+    _Atomic(int) forkless_pending_close;   /* Main thread asks the forkless save to hand this replica
+                                            * back for closing. Atomic (relaxed) since both threads access it without a lock. */
+    size_t cob_pause_bufpos;               /* COB pause position: bufpos to drain to before suspending. */
+    listNode *cob_pause_tail;              /* COB pause position: last reply list node to drain. */
+    size_t cob_pause_objlen;               /* COB pause position: bytes to drain from tail node. */
+    short replica_req;                     /* Replica requirements: REPLICA_REQ_* */
+    uint64_t associated_rdb_client_id;     /* The client id of this replica's rdb connection */
+    time_t rdb_client_disconnect_time;     /* Time of the first freeClient call on this client. Used for delaying free. */
+    listNode *ref_repl_buf_node;           /* Referenced node of replication buffer blocks,
+                                             see the definition of replBufBlock. */
+    size_t ref_block_pos;                  /* Access position of referenced buffer block,
+                                             i.e. the next offset to send. */
+    sds replica_nodeid;                    /* Node id in cluster mode. */
 
     replicaCompressionState *repl_compression; /* Primary-side compression state for this link, or NULL for plaintext. */
 } ClientReplicationData;
@@ -1730,10 +1755,9 @@ typedef struct rdbSaveInfo {
     int repl_id_is_set;                   /* True if repl_id field is set. */
     char repl_id[CONFIG_RUN_ID_SIZE + 1]; /* Replication ID. */
     long long repl_offset;                /* Replication offset. */
-    bool loaded_compressed;               /* True if rdbLoad() read a streaming-compressed file. */
 } rdbSaveInfo;
 
-#define RDB_SAVE_INFO_INIT {-1, 0, "0000000000000000000000000000000000000000", -1, false}
+#define RDB_SAVE_INFO_INIT {-1, 0, "0000000000000000000000000000000000000000", -1}
 
 struct malloc_stats {
     size_t zmalloc_used;
@@ -2203,7 +2227,7 @@ struct valkeyServer {
     int rdb_key_save_delay;               /* Delay in microseconds between keys while
                                            * writing aof or rdb. (for testings). negative
                                            * value means fractions of microseconds (on average). */
-    int bgsave_default_method;            /* Default bgsave method: RDB_BGSAVE_TYPE_FORK or RDB_BGSAVE_TYPE_FORKLESS */
+    int forkless_policy;                  /* Fork vs forkless policy: FORKLESS_POLICY_REQUIRE_FORK, _REQUIRE_FORKLESS, or _PREFER_FORKLESS */
     int key_load_delay;                   /* Delay in microseconds between keys while
                                            * loading aof or rdb. (for testings). negative
                                            * value means fractions of microseconds (on average). */
@@ -2336,6 +2360,8 @@ struct valkeyServer {
     int repl_replica_lazy_flush;                   /* Lazy FLUSHALL before loading DB? */
     monotime repl_full_sync_start_time;            /* Monotonic time when full sync started. */
     long long repl_full_sync_complete_duration_ms; /* Duration of the last successful full sync in ms. */
+    int wait_for_psync_offset;                     /* Replica waiting for REPLCONF psync-offset. */
+    int skip_psync_offset;                         /* Skip psync-offset command in repl backlog. */
     /* Import Mode */
     int import_mode; /* If true, server is in import mode and forbid expiration and eviction. */
     /* Synchronous replication. */
@@ -2527,7 +2553,7 @@ struct valkeyServer {
     /* Coordinate failover info */
     mstime_t failover_end_time;              /* Deadline for failover command. */
     int force_failover;                      /* If true then failover will be forced at the
-                                              * deadline, otherwise failover is aborted. */
+                                              * deadline; otherwise, failover is aborted. */
     char *target_replica_host;               /* Failover target host. If null during a
                                               * failover then any replica can be used. */
     int target_replica_port;                 /* Failover target port */
@@ -2738,6 +2764,13 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  * This is the meaning of the flags:
  *
  * CMD_WRITE:       Write command (may modify the key space).
+ *                  WARNING: a command marked CMD_WRITE (or CMD_MAY_REPLICATE)
+ *                  is accepted by the RDB inline-replication opcode
+ *                  (RDB_OPCODE_UPDATE) and will be executed through a fake
+ *                  client, with ACL checks bypassed, when such an RDB is
+ *                  loaded - including a persisted dump.rdb or AOF preamble, not
+ *                  only a live replication stream. Only mark a command with
+ *                  these flags if it is safe to run unconditionally on load.
  *
  * CMD_READONLY:    Commands just reading from keys without changing the content.
  *                  Note that commands that don't read from the keyspace such as
@@ -2786,8 +2819,13 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  *                      allowed under circumstances where write commands are disallowed.
  *                      Examples include PUBLISH, which replicates pubsub messages,and
  *                      EVAL, which may execute write commands, which are replicated,
- *                      or may just execute read commands. A command can not be marked
+ *                      or may just execute read commands. A command cannot be marked
  *                      both CMD_WRITE and CMD_MAY_REPLICATE
+ *                      WARNING: like CMD_WRITE, a command marked CMD_MAY_REPLICATE
+ *                      is accepted by the RDB inline-replication opcode and runs
+ *                      on load through a fake client with ACL checks bypassed. Only
+ *                      mark a command with it if it is safe to run unconditionally
+ *                      on load.
  *
  * CMD_SENTINEL:    This command is present in sentinel mode.
  *
@@ -2808,7 +2846,7 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  *                   populateCommandLegacyRangeSpec.
  *
  * CMD_ALLOW_BUSY: The command can run while another command is running for
- *                 a long time (timedout script, module command that yields)
+ *                 a long time (timed out script, module command that yields)
  *
  * CMD_MODULE_GETCHANNELS: Use the modules getchannels interface.
  *
@@ -3084,6 +3122,7 @@ void dictVanillaFree(void *val);
 #define READ_FLAGS_CROSSSLOT (1 << 20)
 #define READ_FLAGS_PREFETCHED (1 << 21)
 #define READ_FLAGS_ERROR_INVALID_CRLF (1 << 22)
+#define READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL (1 << 23)
 
 /* Write flags for various write errors and states */
 #define WRITE_FLAGS_WRITE_ERROR (1 << 0)
@@ -3222,6 +3261,7 @@ void protectClient(client *c);
 void unprotectClient(client *c);
 void initSharedQueryBuf(void);
 void freeSharedQueryBuf(void);
+int isSharedQueryBufRegistered(int tid);
 client *lookupClientByID(uint64_t id);
 int authRequired(client *c);
 void clientSetUser(client *c, user *u, int authenticated);
@@ -3238,7 +3278,7 @@ void releaseReplyReferences(client *c);
 void resetLastWrittenBuf(client *c);
 int clientConnPostponeMask(client *c);
 
-int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_idx, int max_args, int *flags, int *unit, int *expire_idx, robj **expire, robj **compare_val, robj **incrby_val);
+int parseExtendedCommandArgumentsOrReply(client *c, int command_type, int start_idx, int max_args, int *flags, int *unit, int *expire_idx, robj **expire, robj **compare_val, robj **incrby_val, robj **lbound_val, robj **ubound_val);
 
 /* logreqres.c - logging of requests and responses */
 void reqresReset(client *c, int free_buf);
@@ -3269,6 +3309,9 @@ void freeTrackingRadixTree(rax *rt);
 void freeTrackingRadixTreeAsync(rax *rt);
 void freeErrorsRadixTreeAsync(rax *errors);
 void trackingLimitUsedSlots(void);
+void trackingSweepDeadClients(void);
+void trackingSweepFull(void);
+int defragTrackingTable(monotime endtime);
 uint64_t trackingGetTotalItems(void);
 uint64_t trackingGetTotalKeys(void);
 uint64_t trackingGetTotalPrefixes(void);
@@ -3411,6 +3454,7 @@ ssize_t syncReadLine(int fd, char *ptr, ssize_t size, long long timeout);
 int prepareReplicasToWrite(void);
 void replicationFeedReplicas(int dictid, robj **argv, int argc);
 void replicationFeedStreamFromPrimaryStream(char *buf, size_t buflen);
+void replicationFeedStreamFromSlotImport(int start_dbid, int end_dbid, char *buf, size_t buflen);
 void resetReplicationBuffer(void);
 void feedReplicationBuffer(char *buf, size_t len);
 void freeReplicaReferencedReplBuffer(client *replica);
@@ -3424,6 +3468,9 @@ void resizeReplicationBacklog(void);
 void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disconnect_blocked);
 void replicationUnsetPrimary(void);
 void refreshGoodReplicasCount(void);
+void resumeReplicaCobFlush(client *replica);
+void computeCobFlushStopPosition(client *c, listNode **block, size_t *bufpos);
+void pauseCobSendAtCurrentPositionForAck(client *c);
 int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);
 void unblockClientWaitingReplicas(client *c);
@@ -4548,6 +4595,7 @@ int dbHasNoKeys(int dbid);
 bool dbsHaveNoKeys(void);
 serverDb *createDatabaseIfNeeded(int id);
 void swapMainDbWithTempDb(serverDb **tempDb);
+void dbSwapDataFields(serverDb *db1, serverDb *db2);
 sds getVersion(void);
 void debugPauseProcess(void);
 

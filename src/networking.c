@@ -32,6 +32,7 @@
 #include "cluster_slot_stats.h"
 #include "cluster_migrateslots.h"
 #include "script.h"
+#include "forkless.h"
 #include "intset.h"
 #include "sds.h"
 #include "fpconv_dtoa.h"
@@ -162,6 +163,12 @@ static int parseMultibulk(client *c,
 
 int ProcessingEventsWhileBlocked = 0; /* See processEventsWhileBlocked(). */
 _Thread_local sds thread_shared_qb = NULL;
+
+/* fork() only preserves the calling thread's TLS. Keep a process-wide reference
+ * to each thread's shared query buffer so allocations owned by vanished worker
+ * threads remain reachable in the child. The registry is otherwise used only
+ * to verify worker cleanup. */
+static _Atomic(sds) shared_querybuf_registry[IO_THREADS_MAX_NUM];
 
 typedef enum {
     PARSE_OK = 0,
@@ -408,6 +415,7 @@ client *createClient(connection *conn) {
     c->client_list_node = NULL;
     c->io_read_state = CLIENT_IDLE;
     c->io_write_state = CLIENT_IDLE;
+    c->cur_tid = 0;
     c->nwritten = 0;
     c->last_memory_usage = 0;
     c->last_memory_type = CLIENT_TYPE_NORMAL;
@@ -452,14 +460,28 @@ void installClientWriteHandler(client *c) {
  * If we fail and there is more data to write, compared to what the socket
  * buffers can hold, then we'll really install the handler. */
 void putClientInPendingWriteQueue(client *c) {
+    /* A replica in a forkless full-sync may be in a state where it's paused until it
+     * ACKs the RDB, so don't schedule any writes to it until the ACK is received. */
+    if (c->flag.replica && c->repl_data && c->repl_data->stop_send_data_until_ack) return;
+
+    /* Client is in a state where its output may be scheduled for writing. */
+    int ready_to_write = !c->repl_data ||
+                         c->repl_data->repl_state == REPL_STATE_NONE ||
+                         (isReplicaReadyForReplData(c) && !c->repl_data->repl_start_cmd_stream_on_ack);
+    /* Slot migration may forbid installing the write handler right now. */
+    int slot_migration_allows = clusterSlotMigrationShouldInstallWriteHandler(c);
+    /* During a forkless socket full-sync a WAIT_BGSAVE_END replica has sync
+     * framing/header (and later the footer) buffered in its COB by the main
+     * thread; schedule it for writing so the event loop flushes that COB. */
+    int forkless_socket_sync = c->repl_data &&
+                               c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END &&
+                               server.rdb_write_target == RDB_WRITE_TARGET_SOCKET &&
+                               server.cur_bgsave_type == RDB_BGSAVE_TYPE_FORKLESS;
+
     /* Schedule the client to write the output buffers to the socket only
      * if not already done and, for replicas, if the replica can actually receive
      * writes at this stage. */
-    if (!c->flag.pending_write &&
-        (!c->repl_data ||
-         c->repl_data->repl_state == REPL_STATE_NONE ||
-         (isReplicaReadyForReplData(c) && !c->repl_data->repl_start_cmd_stream_on_ack)) &&
-        clusterSlotMigrationShouldInstallWriteHandler(c)) {
+    if (!c->flag.pending_write && ((ready_to_write && slot_migration_allows) || forkless_socket_sync)) {
         /* Here instead of installing the write handler, we just flag the
          * client and put it into a list of clients that have something
          * to write to the socket. This way before re-entering the event
@@ -761,8 +783,10 @@ void _addReplyToBufferOrList(client *c, const char *s, size_t len) {
     /* Replicas should normally not cause any writes to the reply buffer. In case a rogue replica sent a command on the
      * replication link that caused a reply to be generated we'll simply disconnect it.
      * Note this is the simplest way to check a command added a response. Replication links are used to write data but
-     * not for responses, so we should normally never get here on a replica client. */
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+     * not for responses, so we should normally never get here on a replica client.
+     * Exception: during forkless-save-to-socket, we use the COB to send RDB data to replicas. */
+    if (getClientType(c) == CLIENT_TYPE_REPLICA &&
+        !(c->repl_data && c->repl_data->using_cob)) {
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
         logInvalidUseAndFreeClientAsync(c, "Replica generated a reply to command '%s'",
                                         cmdname ? cmdname : "<unknown>");
@@ -870,7 +894,7 @@ void addReplyProto(client *c, const char *s, size_t len) {
  * -ERRORCODE Error Message<CR><LF>
  *
  * If the error code is already passed in the string 's', the error
- * code provided is used, otherwise the string "-ERR " for the generic
+ * code provided is used; otherwise, the string "-ERR " for the generic
  * error code is automatically added.
  * Note that 's' must NOT end with \r\n. */
 void addReplyErrorLength(client *c, const char *s, size_t len) {
@@ -964,11 +988,18 @@ void afterErrorReply(client *c, const char *s, size_t len, int flags) {
 
         if (len > 4096) len = 4096;
         sds cmdname = c->lastcmd ? c->lastcmd->fullname : NULL;
+        /* The error text may echo command arguments, which can be user data. */
+        const char *err = s;
+        int err_len = (int)len;
+        if (server.hide_user_data_from_log) {
+            err = "*redacted*";
+            err_len = (int)strlen(err);
+        }
         serverLog(LL_WARNING,
                   "== CRITICAL == This %s is sending an error "
                   "to its %s: '%.*s' after processing the command "
                   "'%s'",
-                  from, to, (int)len, s, cmdname ? cmdname : "<unknown>");
+                  from, to, err_len, err, cmdname ? cmdname : "<unknown>");
         if (ctype == CLIENT_TYPE_PRIMARY && server.repl_backlog && server.repl_backlog->histlen > 0) {
             showLatestBacklog();
         }
@@ -1063,7 +1094,7 @@ void addReplyErrorFormatInternal(client *c, int flags, const char *fmt, va_list 
     va_end(copy);
     /* Trim any newlines at the end (ones will be added by addReplyErrorLength) */
     s = sdstrim(s, "\r\n");
-    /* Make sure there are no newlines in the middle of the string, otherwise
+    /* Make sure there are no newlines in the middle of the string; otherwise,
      * invalid protocol is emitted. */
     s = sdsmapchars(s, "\r\n", "  ", 2);
     addReplyErrorLength(c, s, sdslen(s));
@@ -1127,7 +1158,7 @@ void trimReplyUnusedTailSpace(client *c) {
     if (!tail) return;
 
     /* We only try to trim the space is relatively high (more than a 1/4 of the
-     * allocation), otherwise there's a high chance realloc will NOP.
+     * allocation); otherwise, there's a high chance realloc will NOP.
      * Also, to avoid large memmove which happens as part of realloc, we only do
      * that if the used part is small.
      *
@@ -1557,8 +1588,34 @@ void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
     _addReplyToBufferOrList(c, "\r\n", 2);
 }
 
+/* Fuse small bulk replies into one append to avoid repeating reply-routing
+ * bookkeeping. The limit bounds the additional copy and stack usage. */
+#define BULK_REPLY_FUSE_LIMIT 512
+
 void addWritePreparedReplyBulkCBuffer(writePreparedClient *wpc, const void *p, size_t len) {
     client *c = (client *)wpc;
+    if (len <= BULK_REPLY_FUSE_LIMIT) {
+        /* Keep reply routing and accounting in _addReplyToBufferOrList(). */
+        char buf[LONG_STR_SIZE + 3 + BULK_REPLY_FUSE_LIMIT + 2];
+        char *dst = buf;
+        if (len < OBJ_SHARED_BULKHDR_LEN) {
+            /* Reuse the shared "$<len>\r\n" strings for small lengths. */
+            size_t hdr_len = OBJ_SHARED_HDR_STRLEN(len);
+            memcpy(dst, objectGetVal(shared.bulkhdr[len]), hdr_len);
+            dst += hdr_len;
+        } else {
+            *dst++ = '$';
+            dst += ll2string(dst, LONG_STR_SIZE, (long long)len);
+            *dst++ = '\r';
+            *dst++ = '\n';
+        }
+        memcpy(dst, p, len);
+        dst += len;
+        *dst++ = '\r';
+        *dst++ = '\n';
+        _addReplyToBufferOrList(c, buf, (size_t)(dst - buf));
+        return;
+    }
     _addReplyLongLongWithPrefix(c, len, '$');
     _addReplyToBufferOrList(c, p, len);
     _addReplyToBufferOrList(c, "\r\n", 2);
@@ -1814,6 +1871,11 @@ void copyReplicaOutputBuffer(client *dst, client *src) {
  * the socket. */
 int clientHasPendingReplies(client *c) {
     if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+        /* Replicas using private COB (during forkless-save-to-socket) check
+         * the private buffer, not the shared replication buffer. */
+        if (c->repl_data && c->repl_data->using_cob) {
+            return c->bufpos || listLength(c->reply);
+        }
         /* Replicas use global shared replication buffer instead of
          * private output buffer. */
         serverAssert(c->bufpos == 0 && listLength(c->reply) == 0);
@@ -2362,6 +2424,23 @@ int freeClient(client *c) {
         return 0;
     }
 
+    /* The forkless save's background thread may still be using this replica's
+     * connection, so we must not free it here. Instead, remove it from the
+     * replica tracking now and mark it for close; the forkless save owns the
+     * client and frees it when it is safe to do so. */
+    if (c->flag.forkless_managed) {
+        if (atomic_load_explicit(&c->repl_data->forkless_pending_close, memory_order_relaxed))
+            return 0; /* Already marked, don't double-process. */
+        serverLog(LL_NOTICE, "freeClient: primary trying to free client(%llu) owned by forkless save",
+                  (unsigned long long)c->id);
+        retireForklessManagedReplica(c);
+        atomic_store_explicit(&c->repl_data->forkless_pending_close, 1, memory_order_relaxed);
+        return 0;
+    }
+
+    /* Wait for IO operations to be done before proceeding */
+    waitForClientIO(c);
+
     /* For connected clients, call the disconnection event of modules hooks. */
     if (c->conn) {
         moduleFireServerEvent(VALKEYMODULE_EVENT_CLIENT_CHANGE, VALKEYMODULE_SUBEVENT_CLIENT_CHANGE_DISCONNECTED, c);
@@ -2391,8 +2470,13 @@ int freeClient(client *c) {
         if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
             c->flag.close_asap = 0;
             c->flag.close_after_reply = 0;
-            replicationCachePrimary(c);
-            return 0;
+            if (server.wait_for_psync_offset) {
+                serverLog(LL_NOTICE, "Not caching primary state because replica doesn't have correct replication offset for psync.");
+                server.wait_for_psync_offset = 0;
+            } else {
+                replicationCachePrimary(c);
+                return 0;
+            }
         }
     }
 
@@ -2649,6 +2733,10 @@ int freeClientsInAsyncFreeQueue(void) {
         }
 
         if (c->flag.protected || clientHasPendingIO(c)) continue;
+
+        /* Don't free clients owned by forkless save — they'll be freed when
+         * forkless save completes or abandons them. */
+        if (c->flag.forkless_managed) continue;
 
         c->flag.close_asap = 0;
         freeClient(c);
@@ -3147,7 +3235,7 @@ static void proceedToUnwritten(replyIOV *reply, int nwritten) {
 
 /* This function should be called from _writeToClient when the reply list is not empty,
  * it gathers the scattered buffers from reply list and sends them away with connWritev.
- * If we write successfully, it returns C_OK, otherwise, C_ERR is returned.
+ * If we write successfully, it returns C_OK; otherwise, C_ERR is returned.
  * Sets the c->nwritten to the number of bytes the server wrote to the client.
  * Can be called from the main thread or an I/O thread */
 static int writevToClient(client *c) {
@@ -3162,8 +3250,7 @@ static int writevToClient(client *c) {
     size_t bufpos = 0;
     listNode *lastblock;
     if (inMainThread()) {
-        lastblock = listLast(c->reply);
-        bufpos = c->bufpos;
+        computeCobFlushStopPosition(c, &lastblock, &bufpos);
     } else {
         lastblock = c->io_last_reply_block;
         bufpos = lastblock ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -3179,11 +3266,12 @@ static int writevToClient(client *c) {
 
     /* If the static reply buffer is not empty,
      * add it to the iov array for writev() as well. */
-    if (bufpos > 0) {
+    if (c->bufpos > 0) {
+        size_t buflen = lastblock ? (size_t)c->bufpos : bufpos;
         if (c->flag.buf_encoded) {
-            trackBufReferences(c->buf, bufpos, c);
+            trackBufReferences(c->buf, buflen, c);
         }
-        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, bufpos, &reply, &buf_metadata[bufcnt++]);
+        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, buflen, &reply, &buf_metadata[bufcnt++]);
     }
 
     if (lastblock) {
@@ -3194,11 +3282,19 @@ static int writevToClient(client *c) {
             clientReplyBlock *o = listNodeValue(next);
 
             size_t used = o->used;
-            /* Use c->io_last_bufpos as the currently used portion of the block.
-             * We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
-             * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
-             * that may not yet be visible to the current thread*/
-            if (!inMainThread() && next == lastblock) used = c->io_last_bufpos;
+            if (next == lastblock) {
+                if (inMainThread()) {
+                    /* Trust the computed stop position: the full block end for
+                     * a normal flush, or the capped point for a partial one. */
+                    used = bufpos;
+                } else {
+                    /* Use c->io_last_bufpos as the currently used portion of the block.
+                     * We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
+                     * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
+                     * that may not yet be visible to the current thread*/
+                    used = c->io_last_bufpos;
+                }
+            }
 
             if (used == 0) { /* empty node, skip over it. */
                 if (next == lastblock) break;
@@ -3259,16 +3355,14 @@ static int writevToClient(client *c) {
 }
 
 /* This function does actual writing output buffers to non-replica client, it is called by writeToClient.
- * If we write successfully, it returns C_OK, otherwise, C_ERR is returned,
+ * If we write successfully, it returns C_OK; otherwise, C_ERR is returned,
  * and 'c->nwritten' is set to the number of bytes the server wrote to the client. */
 int _writeToClient(client *c) {
     listNode *lastblock;
     size_t bufpos;
 
     if (inMainThread()) {
-        /* In the main thread, access bufpos and lastblock directly */
-        lastblock = listLast(c->reply);
-        bufpos = (size_t)c->bufpos;
+        computeCobFlushStopPosition(c, &lastblock, &bufpos);
     } else {
         /* If there is a last block, use bufpos directly; otherwise, use io_last_bufpos */
         bufpos = c->io_last_reply_block ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -3466,18 +3560,70 @@ static void _postWriteToClient(client *c) {
     }
 }
 
+/* Compute how far a client's COB (static c->buf plus the c->reply overflow
+ * blocks) should be written out in the current flush, via out-params:
+ *   *block  -> the last reply block to include, or NULL if the reply list is
+ *              empty (everything to send is still in c->buf).
+ *   *bufpos -> how many bytes to send: an offset into c->buf when *block is
+ *              NULL, otherwise the byte count within that last block.
+ *
+ * Usually this is the real end of the COB (the whole COB is ready to go out).
+ * For a forkless save-to-socket replica a COB pause point caps it right after
+ * the RDB end marker (see suspendReplicaCobFlushUntilAck) so post-marker
+ * replication mirrored into the COB is withheld until the replica ACKs. */
+void computeCobFlushStopPosition(client *c, listNode **block, size_t *bufpos) {
+    if (c->repl_data && c->repl_data->cob_pause_bufpos > 0) {
+        *block = NULL;
+        *bufpos = c->repl_data->cob_pause_bufpos;
+        return;
+    }
+
+    if (c->repl_data && c->repl_data->cob_pause_tail != NULL) {
+        *block = c->repl_data->cob_pause_tail;
+        *bufpos = c->repl_data->cob_pause_objlen;
+        return;
+    }
+
+    *block = listLast(c->reply);
+    if (*block) {
+        clientReplyBlock *o = listNodeValue(*block);
+        *bufpos = o->used;
+    } else {
+        *bufpos = c->bufpos;
+    }
+}
+
+/* Once writeToClient() has written to THIS point in the COB, stop writing until an ACK is received
+ * from the client.  It is assumed that the buffer is NOT currently empty (or it should have been
+ * paused immediately) and also, the client must be performing a forkless save (and would be
+ * expecting an ACK).
+ */
+void pauseCobSendAtCurrentPositionForAck(client *c) {
+    serverAssert(c->repl_data);
+    serverAssert(c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END);
+
+    if (listLength(c->reply) > 0) {
+        c->repl_data->cob_pause_tail = listLast(c->reply);
+        clientReplyBlock *obj = listNodeValue(c->repl_data->cob_pause_tail);
+        c->repl_data->cob_pause_objlen = obj->used;
+    } else {
+        c->repl_data->cob_pause_bufpos = c->bufpos;
+    }
+}
+
 /* Updates the client's memory usage and bucket and server stats after writing.
  * If a write handler is installed , it will attempt to clear the write event.
- * If the client is no longer valid, it will return C_ERR, otherwise C_OK. */
+ * If the client is no longer valid, it will return C_ERR; otherwise, C_OK. */
 int postWriteToClient(client *c) {
     c->io_last_reply_block = NULL;
     c->io_last_bufpos = 0;
     /* Update total number of writes on server */
     server.stat_total_writes_processed++;
-    if (getClientType(c) != CLIENT_TYPE_REPLICA) {
-        _postWriteToClient(c);
-    } else {
+
+    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
         postWriteToReplica(c);
+    } else {
+        _postWriteToClient(c);
     }
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
@@ -3487,6 +3633,45 @@ int postWriteToClient(client *c) {
             return C_ERR;
         }
     }
+
+    /* Forkless COB drain check: detect when the RDB end marker has been
+     * fully flushed to the socket, then suspend writes until ACK.
+     * Runs after _postWriteToClient so c->bufpos==0 when fully drained. */
+    if (c->nwritten > 0 && c->repl_data && c->repl_data->using_cob) {
+        c->repl_data->tot_rdb_bytes_sent += c->nwritten;
+        bool sentRdbCOB = false;
+
+        if (c->repl_data->cob_pause_bufpos > 0 &&
+            (c->io_last_written.bufpos == c->repl_data->cob_pause_bufpos || c->bufpos == 0)) {
+            c->repl_data->cob_pause_bufpos = 0;
+            serverAssert(c->repl_data->cob_pause_objlen == 0);
+            serverAssert(c->repl_data->cob_pause_tail == NULL);
+            sentRdbCOB = true;
+        } else if (c->repl_data->cob_pause_objlen > 0 &&
+                   (((listFirst(c->reply) == c->repl_data->cob_pause_tail) &&
+                     c->io_last_written.bufpos == c->repl_data->cob_pause_objlen) ||
+                    listLength(c->reply) == 0)) {
+            serverAssert(c->repl_data->cob_pause_bufpos == 0);
+            c->repl_data->cob_pause_objlen = 0;
+            c->repl_data->cob_pause_tail = NULL;
+            sentRdbCOB = true;
+        }
+
+        if (sentRdbCOB) {
+            if (connHasWriteHandler(c->conn)) connSetWriteHandler(c->conn, NULL);
+            suspendReplicaCobFlushUntilAck(c);
+            serverLog(LL_NOTICE, "Halting COB writes; waiting for ACK.  Client(%llu)",
+                      (unsigned long long)c->id);
+        }
+
+        /* Switch replica to the shared replication buffer once ONLINE and COB empty. */
+        serverAssert(c->repl_data);
+        if (c->repl_data->repl_state == REPLICA_STATE_ONLINE &&
+            listLength(c->reply) == 0 && c->bufpos == 0) {
+            c->repl_data->using_cob = 0;
+        }
+    }
+
     if (c->nwritten > 0) {
         c->net_output_bytes += c->nwritten;
         /* For replicated clients we don't count sending data
@@ -3523,7 +3708,7 @@ int writeToClient(client *c) {
     c->nwritten = 0;
     c->write_flags = 0;
 
-    if (getClientType(c) == CLIENT_TYPE_REPLICA) {
+    if (getClientType(c) == CLIENT_TYPE_REPLICA && !(c->repl_data && c->repl_data->using_cob)) {
         writeToReplica(c);
     } else {
         _writeToClient(c);
@@ -3636,6 +3821,9 @@ void handleParseError(client *c) {
     } else if (flags & READ_FLAGS_ERROR_UNBALANCED_QUOTES) {
         addReplyError(c, "Protocol error: unbalanced quotes in request");
         setProtocolError("unbalanced quotes in inline request", c);
+    } else if (flags & READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL) {
+        addReplyError(c, "Protocol error: embedded NUL byte in inline request");
+        setProtocolError("embedded NUL byte in inline request", c);
     } else if (flags & READ_FLAGS_ERROR_INVALID_CRLF) {
         addReplyError(c, "Protocol error: invalid CRLF in request");
         setProtocolError("invalid CRLF in request", c);
@@ -3660,12 +3848,12 @@ int isParsingError(client *c) {
                             READ_FLAGS_ERROR_UNAUTHENTICATED_BULK_LEN | READ_FLAGS_ERROR_MBULK_INVALID_BULK_LEN |
                             READ_FLAGS_ERROR_BIG_BULK_COUNT | READ_FLAGS_ERROR_MBULK_UNEXPECTED_CHARACTER |
                             READ_FLAGS_ERROR_UNEXPECTED_INLINE_FROM_REPLICATED_CLIENT | READ_FLAGS_ERROR_UNBALANCED_QUOTES |
-                            READ_FLAGS_ERROR_INVALID_CRLF);
+                            READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL | READ_FLAGS_ERROR_INVALID_CRLF);
 }
 
 /* This function is called after the query-buffer was parsed.
  * It is used to handle parsing errors and to update the client state.
- * The function returns C_OK if a command can be executed, otherwise C_ERR. */
+ * The function returns C_OK if a command can be executed; otherwise, C_ERR. */
 parseResult handleParseResults(client *c) {
     if (isParsingError(c)) {
         handleParseError(c);
@@ -3727,7 +3915,10 @@ void processClientIOWriteDone(client *c) {
         if (!c || !c->conn) return;
     }
 
-    if (!clientHasPendingReplies(c)) return;
+    /* A replica paused waiting for a full-sync ACK still needs its write path kept
+     * active even with no pending replies, so it can flush the paused COB up to the
+     * ACK point. */
+    if (!clientHasPendingReplies(c) && !(c->repl_data && c->repl_data->stop_send_data_until_ack)) return;
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
@@ -3781,6 +3972,12 @@ int handleClientsWithPendingWrites(void) {
 
         /* Try to write buffers to the client socket. */
         if (writeToClient(c) == C_ERR) continue;
+
+        /* If the client is a replica waiting for ACK, don't install write handler. */
+        if (c->flag.replica && c->repl_data && c->repl_data->stop_send_data_until_ack) {
+            serverLog(LL_NOTICE, "After write, replica is now waiting for ACK");
+            continue;
+        }
 
         /* If after the synchronous writes above we still have data to
          * output to the client, we need to install the writable handler. */
@@ -3856,13 +4053,20 @@ void resetClientIOState(client *c) {
 /* Initializes the shared query buffer to a new sds with the default capacity.
  * Need to ensure the initlen is not less than readlen in readToQueryBuf. */
 void initSharedQueryBuf(void) {
-    thread_shared_qb = sdsnewlen(NULL, PROTO_IOBUF_LEN);
-    sdsclear(thread_shared_qb);
+    sds querybuf = sdsnewlen(NULL, PROTO_IOBUF_LEN);
+    sdsclear(querybuf);
+    atomic_store_explicit(&shared_querybuf_registry[getCurTid()], querybuf, memory_order_relaxed);
+    thread_shared_qb = querybuf;
 }
 
 void freeSharedQueryBuf(void) {
     sdsfree(thread_shared_qb);
     thread_shared_qb = NULL;
+    atomic_store_explicit(&shared_querybuf_registry[getCurTid()], NULL, memory_order_relaxed);
+}
+
+int isSharedQueryBufRegistered(int tid) {
+    return atomic_load_explicit(&shared_querybuf_registry[tid], memory_order_relaxed) != NULL;
 }
 
 /* This function is used when we want to re-enter the event loop but there
@@ -3910,7 +4114,7 @@ void parseInlineBuffer(client *c) {
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
 
     /* Search for end of line */
-    newline = strchr(c->querybuf + c->qb_pos, '\n');
+    newline = memchr(c->querybuf + c->qb_pos, '\n', sdslen(c->querybuf) - c->qb_pos);
 
     /* Nothing to do without a \r\n */
     if (newline == NULL) {
@@ -3925,6 +4129,14 @@ void parseInlineBuffer(client *c) {
 
     /* Split the input buffer up to the \r\n */
     querylen = newline - (c->querybuf + c->qb_pos);
+
+    /* Reject a raw NUL byte in the line, because sdssplitargs() doesn't
+     * handle it. Binary payloads must use the quoted \x00 escape form. */
+    if (memchr(c->querybuf + c->qb_pos, '\0', querylen)) {
+        c->read_flags |= READ_FLAGS_ERROR_NUL_IN_INLINE_PROTOCOL;
+        return;
+    }
+
     argv = sdsnsplitargs(c->querybuf + c->qb_pos, querylen, &argc);
     if (argv == NULL) {
         c->read_flags |= READ_FLAGS_ERROR_UNBALANCED_QUOTES;
@@ -4334,8 +4546,16 @@ void commandProcessed(client *c) {
          * replication stream, so reploff must strictly advance. A no-op
          * advance means qb_applied was not maintained for the command we
          * just processed (e.g. a command was backfilled into querybuf without
-         * updating qb_applied). */
-        serverAssert(c->repl_data->reploff > prev_offset);
+         * updating qb_applied).
+         *
+         * Exception: the REPLCONF psync-offset command sent by the primary at
+         * the end of a forkless (socket) full sync. It rebases the replica's
+         * offset onto the primary's (see the skip_psync_offset block below)
+         * rather than advancing it, so reploff does not strictly advance for
+         * that one command (and equals prev_offset when the primary offset is
+         * still zero). */
+        serverAssert((prev_offset == 0 && server.skip_psync_offset) ||
+                     c->repl_data->reploff > prev_offset);
     }
 
     /* If the client is replicated we need to compute the difference
@@ -4346,8 +4566,24 @@ void commandProcessed(client *c) {
      * sub-replicas and to the replication backlog. */
     if (isReplicatedClient(c)) {
         long long applied = c->repl_data->reploff - prev_offset;
+        if ((prev_offset == 0) && server.skip_psync_offset) {
+            server.skip_psync_offset = 0;
+            applied = c->repl_data->reploff - server.primary_initial_offset;
+            size_t bytesToSkip = sdslen(c->querybuf) - (c->repl_data->read_reploff - c->repl_data->reploff) - applied;
+            if (bytesToSkip) {
+                c->repl_data->repl_applied += bytesToSkip;
+            }
+        }
         if (applied) {
-            replicationFeedStreamFromPrimaryStream(c->querybuf + c->repl_data->repl_applied, applied);
+            char *stream = c->querybuf + c->repl_data->repl_applied;
+            if (c->slot_migration_job) {
+                /* What was applied ends with a command (or EXEC), so the db
+                 * of the client is the one the proxied stream ends in. */
+                replicationFeedStreamFromSlotImport(c->repl_data->repl_applied_dbid, c->db->id, stream, applied);
+                c->repl_data->repl_applied_dbid = c->db->id;
+            } else {
+                replicationFeedStreamFromPrimaryStream(stream, applied);
+            }
             c->repl_data->repl_applied += applied;
         }
     }
@@ -4360,7 +4596,7 @@ void commandProcessed(client *c) {
  * 2. calls commandProcessed() if the command was handled.
  *
  * The function returns C_ERR in case the client was freed as a side effect
- * of processing the command, otherwise C_OK is returned. */
+ * of processing the command; otherwise, C_OK is returned. */
 int processCommandAndResetClient(client *c) {
     int deadclient = 0;
     client *old_client = server.current_client;
@@ -4877,7 +5113,7 @@ void genClientAddrString(client *client, char *addr, size_t addr_len, int remote
 }
 
 /* This function returns the client peer id, by creating and caching it
- * if client->peerid is NULL, otherwise returning the cached value.
+ * if client->peerid is NULL; otherwise, returning the cached value.
  * The Peer ID never changes during the life of the client, however it
  * is expensive to compute. */
 char *getClientPeerId(client *c) {
@@ -4891,7 +5127,7 @@ char *getClientPeerId(client *c) {
 }
 
 /* This function returns the client bound socket name, by creating and caching
- * it if client->sockname is NULL, otherwise returning the cached value.
+ * it if client->sockname is NULL; otherwise, returning the cached value.
  * The Socket Name never changes during the life of the client, however it
  * is expensive to compute. */
 char *getClientSockname(client *c) {
@@ -5997,7 +6233,7 @@ void clientUnblockCommand(client *c) {
     /* Note that we never try to unblock a client blocked on a module command,
      * or a client blocked by CLIENT PAUSE or some other blocking type which
      * doesn't have a timeout callback (even in the case of UNBLOCK ERROR).
-     * The reason is that we assume that if a command doesn't expect to be timedout,
+     * The reason is that we assume that if a command doesn't expect to be timed out,
      * it also doesn't expect to be unblocked by CLIENT UNBLOCK */
     if (target && target->flag.blocked && blockedClientMayTimeout(target)) {
         if (unblock_error)
