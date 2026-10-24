@@ -487,6 +487,7 @@ static void resumeClientsAndFreeClientList(forklessSaveInfo *saveInfo, bool succ
         } else {
             serverLog(LL_NOTICE, "forkless-save: error or canceled, terminating client(%llu)", (unsigned long long)c->id);
             c->flag.forkless_managed = 0;
+            c->flag.protected_rdb_channel = 0; /* Failed dual-channel snapshot: nothing to protect. */
             if (c->repl_data) c->repl_data->using_cob = 0;
             freeClient(c);
         }
@@ -605,7 +606,10 @@ static long long snapshotEndMonitorTimeProc(struct aeEventLoop *eventLoop, long 
 /* After the background thread finishes writing keys via the connset, the main
  * thread finishes the RDB stream using the COB:
  *   1) Write the EOF, checksum, and eofmark into the COB
- *   2) Hold any further COB writes until the replica ACKs the RDB */
+ *   2) Hold any further COB writes until the replica ACKs the RDB
+ * A dual-channel RDB channel gets the same tail as the fork path gives it: the
+ * $EOF end mark, then a hold that never lifts (that channel never ACKs; its live
+ * stream goes over the main channel), until the replica closes it. */
 static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
     serverAssert(onServerMainThread());
     serverAssert(listLength(saveInfo->u.repl.clients) > 0);
@@ -696,6 +700,10 @@ static void freeAbandonedForklessReplica(client *c) {
     serverAssert(onServerMainThread());
     serverLog(LL_WARNING, "forkless-save: client(%llu) ended replication early", (unsigned long long)c->id);
     c->flag.forkless_managed = 0;
+    /* A dual-channel RDB channel that ended early can't deliver its snapshot,
+     * so stop protecting it for the main channel's PSYNC and free it now (as
+     * updateReplicasWaitingBgsave() does on a failed save). */
+    c->flag.protected_rdb_channel = 0;
     if (c->repl_data) {
         atomic_store_explicit(&c->repl_data->forkless_pending_close, 0, memory_order_relaxed);
         c->repl_data->using_cob = 0;
@@ -950,14 +958,30 @@ int forklessSaveToSockets(int req, int rdbver, compressionAlgo compression_algo)
         client *c = listNodeValue(ln);
         serverAssert(c->repl_data);
         if (c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END) {
+            if (req & REPLICA_REQ_RDB_CHANNEL) {
+                /* Dual-channel RDB channel, as in rdbSaveToReplicasSockets(): send
+                 * $ENDOFF (the snapshot's end offset, taken now, before the
+                 * point-in-time iterator is created in this same event-loop
+                 * pass) ahead of the $EOF-framed RDB, and anchor the backlog so
+                 * the replica's main channel can PSYNC from that offset while
+                 * the RDB streams. On a write error the client is already
+                 * scheduled for async free, so leave it out of the cohort. */
+                connSendTimeout(c->conn, server.repl_timeout * 1000);
+                if (sendCurrentOffsetToReplica(c) != C_OK) continue;
+                addRdbReplicaToPsyncWait(c);
+            }
             serverLog(LL_NOTICE, "forkless-save: beginning save to client ID: %llu", (unsigned long long)c->id);
             listAddNodeTail(saveInfo->u.repl.clients, c);
             c->flag.forkless_managed = 1;
             c->repl_data->using_cob = 1;
         }
     }
-    serverAssert(listLength(saveInfo->u.repl.clients) > 0);
     saveInfo->foreground_queue = NULL;
+    if (listLength(saveInfo->u.repl.clients) == 0) {
+        /* Only reachable for dual-channel, when every $ENDOFF write failed. */
+        serverLog(LL_WARNING, "forkless-save: no replica left to stream to");
+        goto werr;
+    }
 
     /* Initialize RIO with ReplicaCOB. This lets the main thread write sync metadata
      * to all pending replicas through a single rioWrite() call in a non-blocking

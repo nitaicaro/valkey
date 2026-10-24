@@ -1364,8 +1364,9 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
         goto error;
     }
 
-    /* Forkless socket output now honors the cohort's RDB filter and version, and
-     * can whole-stream compress, so it no longer needs to fall back to fork. */
+    /* Forkless socket output honors the cohort's RDB filter and version, can
+     * whole-stream compress, and serves the dual-channel RDB channel, so it
+     * never needs to fall back to fork. */
 
     serverLog(LL_NOTICE, "Starting BGSAVE for SYNC with target: %s using: %s, compression: %s, method: %s",
               (socket_target) ? "replicas sockets" : "disk",
@@ -2467,7 +2468,13 @@ void updateReplicasWaitingBgsave(int bgsaveerr, int type) {
                  * the RDB transfer with the start of the other replication
                  * data. */
                 if (!replicaPutOnline(replica)) {
-                    freeClientAsync(replica);
+                    /* A forkless save queues the RDB tail in the replica's
+                     * private COB, so an rdb-only replica (e.g. a dual-channel
+                     * RDB channel) must be closed only after that drains. */
+                    if (replica->repl_data->using_cob && clientHasPendingReplies(replica))
+                        replica->flag.close_after_reply = 1;
+                    else
+                        freeClientAsync(replica);
                     continue;
                 }
                 replica->repl_data->repl_start_cmd_stream_on_ack = 1;
