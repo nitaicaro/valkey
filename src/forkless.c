@@ -4,6 +4,7 @@
 #include "mutexqueue.h"
 #include "rdb.h"
 #include "bio.h"
+#include "compression_stream.h"
 
 static const void *PROCESS_COMPLETE_ITEM = (void *)-1;
 static const int SNAPSHOT_FILE_CLOSE_MONITOR_INTERVAL_MS = 200;
@@ -26,6 +27,11 @@ typedef struct {
         struct {
             list *clients;
             char eofmark[RDB_EOF_MARK_SIZE];
+            /* Whole-stream compressor wrapping the RDB frame (header..footer),
+             * but not the plaintext $EOF prefix/suffix. Only valid while
+             * writer_active is set. */
+            streamWriter writer;
+            bool writer_active;
         } repl;
     } u;
 } forklessSaveInfo;
@@ -40,6 +46,34 @@ static int forklessSaveShouldAbort(rio *r) {
     return saveInfo->iterator && bgIteratorIsTerminating(saveInfo->iterator);
 }
 
+
+/* streamWriter output callback: emit compressed bytes straight to the rio
+ * backend, bypassing the attached writer so they are not compressed again. */
+static int forklessCompressionWrite(void *ctx, const uint8_t *data, size_t len) {
+    return rioWriteRaw((rio *)ctx, data, len) ? C_OK : C_ERR;
+}
+
+/* (Re)apply the compressed-stream state to save_rio. Must be called after
+ * every rioInitWith*() of save_rio while the writer is active, because rio
+ * init resets stream_writer, flags and update_cksum. As in rdbSaveRio(), the
+ * RDB CRC64 is disabled (the trailer is zero) since the codec carries its own
+ * checksum. The writer's write_ctx (&save_rio) stays valid across re-inits. */
+static void forklessApplyStreamWriter(forklessSaveInfo *saveInfo) {
+    if (saveInfo->write_target != RDB_WRITE_TARGET_SOCKET || !saveInfo->u.repl.writer_active) return;
+    rio *r = &saveInfo->save_rio;
+    if (r->stream_writer == NULL) rioAttachStreamWriter(r, &saveInfo->u.repl.writer);
+    r->flags |= RIO_FLAG_SKIP_RDB_CHECKSUM;
+    r->update_cksum = NULL;
+    r->cksum = 0;
+}
+
+/* Release the stream compressor, if any. Safe to call more than once. */
+static void forklessFreeStreamWriter(forklessSaveInfo *saveInfo) {
+    if (saveInfo->write_target != RDB_WRITE_TARGET_SOCKET || !saveInfo->u.repl.writer_active) return;
+    if (saveInfo->save_rio.stream_writer == &saveInfo->u.repl.writer) rioDetachStreamWriter(&saveInfo->save_rio);
+    streamWriterFree(&saveInfo->u.repl.writer);
+    saveInfo->u.repl.writer_active = false;
+}
 
 static int connSetBlocking(connection *conn, bool blocking) {
     int rc = (blocking) ? connBlock(conn) : connNonBlock(conn);
@@ -241,6 +275,7 @@ static int transitionRioReplicaCobToRioConnset(forklessSaveInfo *saveInfo) {
     if (server.rdb_checksum) {
         saveInfo->save_rio.update_cksum = rioGenericUpdateChecksum;
     }
+    forklessApplyStreamWriter(saveInfo);
 
     zfree(conns);
     return C_OK;
@@ -380,6 +415,7 @@ static void *forklessSaveProcessor(void *arg) {
                 if (server.rdb_checksum) {
                     saveInfo->save_rio.update_cksum = rioGenericUpdateChecksum;
                 }
+                forklessApplyStreamWriter(saveInfo);
             }
         } else {
             /* Error before transitioning to connset — still a COB rio. */
@@ -571,6 +607,15 @@ static int finishSocketBasedForklessSaveUsingCob(forklessSaveInfo *saveInfo) {
         ret = C_ERR;
         goto done;
     }
+    /* Close the compressed frame before the plaintext end marker. */
+    if (saveInfo->u.repl.writer_active) {
+        if (streamWriterFinish(&saveInfo->u.repl.writer) == C_ERR) {
+            serverLog(LL_WARNING, "forkless-save: error finishing compressed RDB stream");
+            ret = C_ERR;
+            goto done;
+        }
+        rioDetachStreamWriter(&saveInfo->save_rio);
+    }
     if (rdbWriteEofMarkEnd(&saveInfo->save_rio, saveInfo->u.repl.eofmark) == C_ERR) {
         serverLog(LL_WARNING, "forkless-save: error while writing valkey end eof string");
         ret = C_ERR;
@@ -688,6 +733,7 @@ static void forklessSaveComplete(bool terminated, void *privdata) {
             rioFreeReplicaCOB(&saveInfo->save_rio);
         }
 
+        forklessFreeStreamWriter(saveInfo);
         resumeClientsAndFreeClientList(saveInfo, !saveInfo->terminated && saveInfo->err_code == C_OK);
 
         /* Shut down the replication monitor timer */
@@ -871,7 +917,7 @@ static long long replicationMonitorTimeProc(struct aeEventLoop *eventLoop, long 
     return REPLICATION_MONITOR_INTERVAL_MS;
 }
 
-int forklessSaveToSockets(void) {
+int forklessSaveToSockets(compressionAlgo compression_algo) {
     serverAssert(onServerMainThread());
     serverAssert(currentForklessSave == NULL);
     serverLog(LL_NOTICE, "Beginning forklessSaveToSockets");
@@ -914,6 +960,19 @@ int forklessSaveToSockets(void) {
     if (rdbWriteEofMarkStart(&saveInfo->save_rio, saveInfo->u.repl.eofmark) == C_ERR) {
         serverLog(LL_WARNING, "forkless-save: error writing EOF start marker");
         goto werr;
+    }
+
+    /* Attach the whole-stream compressor after the plaintext $EOF prefix and
+     * before the RDB header, so the frame covers header..footer exactly. */
+    if (compression_algo != ALGO_NONE && compression_algo != ALGO_LZF) {
+        if (streamWriterInit(&saveInfo->u.repl.writer, compression_algo, server.rdb_checksum,
+                             forklessCompressionWrite, &saveInfo->save_rio) == C_ERR) {
+            serverLog(LL_WARNING, "forkless-save: error initializing %s stream compressor",
+                      compressionAlgoName(compression_algo));
+            goto werr;
+        }
+        saveInfo->u.repl.writer_active = true;
+        forklessApplyStreamWriter(saveInfo);
     }
 
     int rc = forklessSaveCommonStart(saveInfo);
@@ -973,6 +1032,7 @@ werr:
     if (saveInfo->u.repl.clients) {
         resumeClientsAndFreeClientList(saveInfo, false);
     }
+    forklessFreeStreamWriter(saveInfo);
     rioFreeReplicaCOB(&saveInfo->save_rio);
     zfree(saveInfo);
     serverLog(LL_WARNING, "Error in forklessSaveToSockets before starting thread");

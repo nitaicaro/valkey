@@ -1364,18 +1364,16 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
         goto error;
     }
 
-    /* Forkless socket output can only emit a plain, current-version,
-     * uncompressed RDB. For any cohort it cannot serve, fall back to fork under
-     * 'prefer-forkless', or fail the sync under 'require-forkless' (which
-     * forbids forking). */
+    /* Forkless socket output can only emit an unfiltered, current-version RDB
+     * (optionally whole-stream compressed). For any cohort it cannot serve,
+     * fall back to fork under 'prefer-forkless', or fail the sync under
+     * 'require-forkless' (which forbids forking). */
     if (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS) {
         const char *reason = NULL;
         if (req & REPLICA_REQ_RDB_MASK) {
             reason = "cohort needs filtered RDB content";
         } else if (rdbver != RDB_VERSION) {
             reason = "cohort needs a non-current RDB version";
-        } else if (sync_compression_algo != ALGO_NONE) {
-            reason = "cohort needs stream compression";
         }
         if (reason != NULL) {
             if (server.forkless_policy == FORKLESS_POLICY_REQUIRE_FORKLESS) {
@@ -1402,7 +1400,7 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
 
     if (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS) {
         if (socket_target) {
-            if (forklessSaveToSockets() == C_ERR) {
+            if (forklessSaveToSockets(sync_compression_algo) == C_ERR) {
                 fail_msg = "Can't start the forkless process for a diskless full sync";
                 goto error;
             }
