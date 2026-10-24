@@ -2161,11 +2161,7 @@ start_server {tags {"repl external:skip cluster:skip"}} {
     }
 }
 
-# Forkless full sync requires the replica to advertise the "inband-repl"
-# capability (it must understand the RDB_OPCODE_UPDATE commands that forkless
-# save inlines into the RDB stream). A forkless-configured primary uses forkless
-# only for replicas that advertise it, and otherwise falls back to a fork-based
-# save.
+# A forkless-configured primary uses a forkless save for diskless full syncs.
 start_server {tags {"repl external:skip"} overrides {forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync no save ""}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
@@ -2177,7 +2173,7 @@ start_server {tags {"repl external:skip"} overrides {forkless-infrastructure-ena
     start_server {overrides {repl-diskless-load disabled}} {
         set replica [srv 0 client]
 
-        test "Forkless full sync is used for a replica that supports inline replication" {
+        test "Forkless full sync is used for a diskless full sync" {
             $replica replicaof $primary_host $primary_port
             wait_for_sync $replica
             assert_equal $primary_dbsize [$replica dbsize]
@@ -2188,37 +2184,9 @@ start_server {tags {"repl external:skip"} overrides {forkless-infrastructure-ena
     }
 }
 
-# A replica running an older version does not advertise "inband-repl", so a
-# forkless-configured primary must fall back to a fork-based save. Requires an
-# old server binary (--other-server-path), otherwise skipped.
-start_server {tags {"repl needs:other-server external:skip"} overrides {forkless-infrastructure-enabled yes forkless-policy prefer-forkless repl-diskless-sync no save ""}} {
-    set primary [srv 0 client]
-    set primary_host [srv 0 host]
-    set primary_port [srv 0 port]
-
-    for {set i 0} {$i < 500} {incr i} { $primary set key:$i val:$i }
-    set primary_dbsize [$primary dbsize]
-
-    start_server {start-other-server 1 config "minimal.conf"} {
-        set replica [srv 0 client]
-
-        test "Forkless primary falls back to fork for a replica without inline-replication support" {
-            set loglines [count_log_lines -1]
-            $replica replicaof $primary_host $primary_port
-            wait_for_sync $replica
-            assert_equal $primary_dbsize [$replica dbsize]
-            assert_equal "val:499" [$replica get key:499]
-            # Confirm the fallback to a fork-based save actually happened.
-            wait_for_log_messages -1 {"*Falling back to fork-based save for SYNC: replica does not support inline replication*"} $loglines 100 100
-        }
-    }
-}
-
-# Live writes that arrive after the bg iterator has finished scanning the
-# keyspace, but before the replica has come online, are not captured by the
-# iterator and cannot yet be served from the shared replication buffer. They
-# must still reach the replica (via the dedicated save buffer) or they are lost
-# -- the offsets converge but the replica is missing keys.
+# Live writes that arrive while a forkless save is streaming the RDB must still
+# reach the replica: they accumulate in its shared-backlog output buffer and are
+# delivered after the RDB, so the offsets converge with no missing keys.
 start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy require-forkless}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
@@ -2228,13 +2196,10 @@ start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastruc
     $primary debug populate 800000
     start_server {overrides {save {}}} {
         set replica [srv 0 client]
-        test "Writes after bg iterator termination still reach the replica" {
+        test "Writes during a forkless save still reach the replica" {
             # Heavy concurrent write load across the whole save, so writes keep
-            # arriving in the window between the iterator finishing its scan and
-            # the replica coming online -- when such writes are neither captured
-            # by the iterator nor yet served from the shared replication buffer.
-            # This load has proved heavy enough to reliably cause writes to land
-            # in that window.
+            # arriving while the RDB is streaming and must be delivered to the
+            # replica from the shared backlog after it comes online.
             set load1 [start_write_load $primary_host $primary_port 10]
             set load2 [start_write_load $primary_host $primary_port 10]
             set load3 [start_write_load $primary_host $primary_port 10]
@@ -2246,8 +2211,7 @@ start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastruc
             } else {
                 fail "Replica didn't sync"
             }
-            # Keep the load running a little past sync completion to cover the
-            # iterator-done -> replica-online handoff, then settle.
+            # Keep the load running a little past sync completion, then settle.
             after 2000
             stop_write_load $load1
             stop_write_load $load2

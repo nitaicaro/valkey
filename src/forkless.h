@@ -12,8 +12,6 @@ void forklessSaveCancel(void);
 int isForklessSaveInProgress(void);
 sds forkless_catInfo(sds info);
 sds forkless_catDebugInfo(sds info);
-void forklessAddReplicationCommandToReplicaCob(int argc, robj **argv);
-void forklessAddRdbSelectToReplicaCob(int dictid);
 void retireForklessManagedReplica(client *c);
 void suspendReplicaCobFlushUntilAck(client *replica);
 

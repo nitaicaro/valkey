@@ -462,7 +462,7 @@ void installClientWriteHandler(client *c) {
 void putClientInPendingWriteQueue(client *c) {
     /* A replica in a forkless full-sync may be in a state where it's paused until it
      * ACKs the RDB, so don't schedule any writes to it until the ACK is received. */
-    if (c->flag.replica && c->repl_data && c->repl_data->stop_send_data_until_ack) return;
+    if (c->flag.replica && c->repl_data && c->repl_data->repl_start_cmd_stream_on_ack) return;
 
     /* Client is in a state where its output may be scheduled for writing. */
     int ready_to_write = !c->repl_data ||
@@ -2470,13 +2470,8 @@ int freeClient(client *c) {
         if (!c->flag.dont_cache_primary && !(c->flag.protocol_error || c->flag.blocked)) {
             c->flag.close_asap = 0;
             c->flag.close_after_reply = 0;
-            if (server.wait_for_psync_offset) {
-                serverLog(LL_NOTICE, "Not caching primary state because replica doesn't have correct replication offset for psync.");
-                server.wait_for_psync_offset = 0;
-            } else {
-                replicationCachePrimary(c);
-                return 0;
-            }
+            replicationCachePrimary(c);
+            return 0;
         }
     }
 
@@ -3250,7 +3245,8 @@ static int writevToClient(client *c) {
     size_t bufpos = 0;
     listNode *lastblock;
     if (inMainThread()) {
-        computeCobFlushStopPosition(c, &lastblock, &bufpos);
+        lastblock = listLast(c->reply);
+        bufpos = c->bufpos;
     } else {
         lastblock = c->io_last_reply_block;
         bufpos = lastblock ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -3266,12 +3262,11 @@ static int writevToClient(client *c) {
 
     /* If the static reply buffer is not empty,
      * add it to the iov array for writev() as well. */
-    if (c->bufpos > 0) {
-        size_t buflen = lastblock ? (size_t)c->bufpos : bufpos;
+    if (bufpos > 0) {
         if (c->flag.buf_encoded) {
-            trackBufReferences(c->buf, buflen, c);
+            trackBufReferences(c->buf, bufpos, c);
         }
-        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, buflen, &reply, &buf_metadata[bufcnt++]);
+        addBufferToReplyIOV(c->flag.buf_encoded, c->buf, bufpos, &reply, &buf_metadata[bufcnt++]);
     }
 
     if (lastblock) {
@@ -3282,19 +3277,11 @@ static int writevToClient(client *c) {
             clientReplyBlock *o = listNodeValue(next);
 
             size_t used = o->used;
-            if (next == lastblock) {
-                if (inMainThread()) {
-                    /* Trust the computed stop position: the full block end for
-                     * a normal flush, or the capped point for a partial one. */
-                    used = bufpos;
-                } else {
-                    /* Use c->io_last_bufpos as the currently used portion of the block.
-                     * We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
-                     * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
-                     * that may not yet be visible to the current thread*/
-                    used = c->io_last_bufpos;
-                }
-            }
+            /* Use c->io_last_bufpos as the currently used portion of the block.
+             * We use io_last_bufpos instead of o->used to ensure that we only access data guaranteed to be visible to the
+             * current thread. Using o->used, which may have been updated by the main thread, could lead to accessing data
+             * that may not yet be visible to the current thread*/
+            if (!inMainThread() && next == lastblock) used = c->io_last_bufpos;
 
             if (used == 0) { /* empty node, skip over it. */
                 if (next == lastblock) break;
@@ -3362,7 +3349,9 @@ int _writeToClient(client *c) {
     size_t bufpos;
 
     if (inMainThread()) {
-        computeCobFlushStopPosition(c, &lastblock, &bufpos);
+        /* In the main thread, access bufpos and lastblock directly */
+        lastblock = listLast(c->reply);
+        bufpos = (size_t)c->bufpos;
     } else {
         /* If there is a last block, use bufpos directly; otherwise, use io_last_bufpos */
         bufpos = c->io_last_reply_block ? (size_t)c->bufpos : c->io_last_bufpos;
@@ -3560,55 +3549,24 @@ static void _postWriteToClient(client *c) {
     }
 }
 
-/* Compute how far a client's COB (static c->buf plus the c->reply overflow
- * blocks) should be written out in the current flush, via out-params:
- *   *block  -> the last reply block to include, or NULL if the reply list is
- *              empty (everything to send is still in c->buf).
- *   *bufpos -> how many bytes to send: an offset into c->buf when *block is
- *              NULL, otherwise the byte count within that last block.
- *
- * Usually this is the real end of the COB (the whole COB is ready to go out).
- * For a forkless save-to-socket replica a COB pause point caps it right after
- * the RDB end marker (see suspendReplicaCobFlushUntilAck) so post-marker
- * replication mirrored into the COB is withheld until the replica ACKs. */
-void computeCobFlushStopPosition(client *c, listNode **block, size_t *bufpos) {
-    if (c->repl_data && c->repl_data->cob_pause_bufpos > 0) {
-        *block = NULL;
-        *bufpos = c->repl_data->cob_pause_bufpos;
-        return;
-    }
-
-    if (c->repl_data && c->repl_data->cob_pause_tail != NULL) {
-        *block = c->repl_data->cob_pause_tail;
-        *bufpos = c->repl_data->cob_pause_objlen;
-        return;
-    }
-
-    *block = listLast(c->reply);
-    if (*block) {
-        clientReplyBlock *o = listNodeValue(*block);
-        *bufpos = o->used;
-    } else {
-        *bufpos = c->bufpos;
-    }
+/* Once the COB holding the RDB end marker has fully drained to the socket,
+ * stop writing until the replica ACKs the RDB. */
+static void suspendCobForAckIfRdbDrained(client *c) {
+    if (c->bufpos != 0 || listLength(c->reply) != 0) return;
+    if (connHasWriteHandler(c->conn)) connSetWriteHandler(c->conn, NULL);
+    suspendReplicaCobFlushUntilAck(c);
+    serverLog(LL_NOTICE, "Halting COB writes; waiting for ACK.  Client(%llu)", (unsigned long long)c->id);
 }
 
-/* Once writeToClient() has written to THIS point in the COB, stop writing until an ACK is received
- * from the client.  It is assumed that the buffer is NOT currently empty (or it should have been
- * paused immediately) and also, the client must be performing a forkless save (and would be
- * expecting an ACK).
+/* Once writeToClient() has drained the COB (which now ends with the RDB end marker), stop writing
+ * until an ACK is received from the client. The client must be performing a forkless save (and
+ * would be expecting an ACK). If the COB is already empty, suspend immediately.
  */
 void pauseCobSendAtCurrentPositionForAck(client *c) {
     serverAssert(c->repl_data);
     serverAssert(c->repl_data->repl_state == REPLICA_STATE_WAIT_BGSAVE_END);
 
-    if (listLength(c->reply) > 0) {
-        c->repl_data->cob_pause_tail = listLast(c->reply);
-        clientReplyBlock *obj = listNodeValue(c->repl_data->cob_pause_tail);
-        c->repl_data->cob_pause_objlen = obj->used;
-    } else {
-        c->repl_data->cob_pause_bufpos = c->bufpos;
-    }
+    suspendCobForAckIfRdbDrained(c);
 }
 
 /* Updates the client's memory usage and bucket and server stats after writing.
@@ -3639,30 +3597,8 @@ int postWriteToClient(client *c) {
      * Runs after _postWriteToClient so c->bufpos==0 when fully drained. */
     if (c->nwritten > 0 && c->repl_data && c->repl_data->using_cob) {
         c->repl_data->tot_rdb_bytes_sent += c->nwritten;
-        bool sentRdbCOB = false;
-
-        if (c->repl_data->cob_pause_bufpos > 0 &&
-            (c->io_last_written.bufpos == c->repl_data->cob_pause_bufpos || c->bufpos == 0)) {
-            c->repl_data->cob_pause_bufpos = 0;
-            serverAssert(c->repl_data->cob_pause_objlen == 0);
-            serverAssert(c->repl_data->cob_pause_tail == NULL);
-            sentRdbCOB = true;
-        } else if (c->repl_data->cob_pause_objlen > 0 &&
-                   (((listFirst(c->reply) == c->repl_data->cob_pause_tail) &&
-                     c->io_last_written.bufpos == c->repl_data->cob_pause_objlen) ||
-                    listLength(c->reply) == 0)) {
-            serverAssert(c->repl_data->cob_pause_bufpos == 0);
-            c->repl_data->cob_pause_objlen = 0;
-            c->repl_data->cob_pause_tail = NULL;
-            sentRdbCOB = true;
-        }
-
-        if (sentRdbCOB) {
-            if (connHasWriteHandler(c->conn)) connSetWriteHandler(c->conn, NULL);
-            suspendReplicaCobFlushUntilAck(c);
-            serverLog(LL_NOTICE, "Halting COB writes; waiting for ACK.  Client(%llu)",
-                      (unsigned long long)c->id);
-        }
+        /* The ACK wait is armed only once the RDB end marker is queued. */
+        if (c->repl_data->repl_start_cmd_stream_on_ack) suspendCobForAckIfRdbDrained(c);
 
         /* Switch replica to the shared replication buffer once ONLINE and COB empty. */
         serverAssert(c->repl_data);
@@ -3918,7 +3854,7 @@ void processClientIOWriteDone(client *c) {
     /* A replica paused waiting for a full-sync ACK still needs its write path kept
      * active even with no pending replies, so it can flush the paused COB up to the
      * ACK point. */
-    if (!clientHasPendingReplies(c) && !(c->repl_data && c->repl_data->stop_send_data_until_ack)) return;
+    if (!clientHasPendingReplies(c) && !(c->repl_data && c->repl_data->repl_start_cmd_stream_on_ack)) return;
 
     if (c->write_flags & WRITE_FLAGS_WRITE_ERROR) {
         /* Install the write handler if there are pending writes in some of the clients as a result of not being
@@ -3973,8 +3909,10 @@ int handleClientsWithPendingWrites(void) {
         /* Try to write buffers to the client socket. */
         if (writeToClient(c) == C_ERR) continue;
 
-        /* If the client is a replica waiting for ACK, don't install write handler. */
-        if (c->flag.replica && c->repl_data && c->repl_data->stop_send_data_until_ack) {
+        /* If the client is a replica waiting for ACK, don't install write handler.
+         * A forkless replica still using its COB has RDB left to drain first. */
+        if (c->flag.replica && c->repl_data && c->repl_data->repl_start_cmd_stream_on_ack &&
+            !c->repl_data->using_cob) {
             serverLog(LL_NOTICE, "After write, replica is now waiting for ACK");
             continue;
         }
@@ -4546,16 +4484,8 @@ void commandProcessed(client *c) {
          * replication stream, so reploff must strictly advance. A no-op
          * advance means qb_applied was not maintained for the command we
          * just processed (e.g. a command was backfilled into querybuf without
-         * updating qb_applied).
-         *
-         * Exception: the REPLCONF psync-offset command sent by the primary at
-         * the end of a forkless (socket) full sync. It rebases the replica's
-         * offset onto the primary's (see the skip_psync_offset block below)
-         * rather than advancing it, so reploff does not strictly advance for
-         * that one command (and equals prev_offset when the primary offset is
-         * still zero). */
-        serverAssert((prev_offset == 0 && server.skip_psync_offset) ||
-                     c->repl_data->reploff > prev_offset);
+         * updating qb_applied). */
+        serverAssert(c->repl_data->reploff > prev_offset);
     }
 
     /* If the client is replicated we need to compute the difference
@@ -4566,14 +4496,6 @@ void commandProcessed(client *c) {
      * sub-replicas and to the replication backlog. */
     if (isReplicatedClient(c)) {
         long long applied = c->repl_data->reploff - prev_offset;
-        if ((prev_offset == 0) && server.skip_psync_offset) {
-            server.skip_psync_offset = 0;
-            applied = c->repl_data->reploff - server.primary_initial_offset;
-            size_t bytesToSkip = sdslen(c->querybuf) - (c->repl_data->read_reploff - c->repl_data->reploff) - applied;
-            if (bytesToSkip) {
-                c->repl_data->repl_applied += bytesToSkip;
-            }
-        }
         if (applied) {
             char *stream = c->querybuf + c->repl_data->repl_applied;
             if (c->slot_migration_job) {

@@ -470,14 +470,12 @@ typedef enum {
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM (1 << 3) /* Supports skipping RDB checksum for sync requests. */
 #define REPLICA_CAPA_LZ4 (1 << 4)               /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD (1 << 5)              /* Accepts Zstd streaming-compressed replication payloads. */
-#define REPLICA_CAPA_INBAND_REPL (1 << 6)       /* Supports RDB_OPCODE_UPDATE for inline replication. */
 #define REPLICA_CAPA_COMPRESSION_MASK (REPLICA_CAPA_LZ4 | REPLICA_CAPA_ZSTD)
 
 /* Replica capability strings */
 #define REPLICA_CAPA_SKIP_RDB_CHECKSUM_STR "skip-rdb-checksum" /* Supports skipping RDB checksum for sync requests. */
 #define REPLICA_CAPA_LZ4_STR "lz4"                             /* Accepts LZ4 streaming-compressed replication payloads. */
 #define REPLICA_CAPA_ZSTD_STR "zstd"                           /* Accepts Zstd streaming-compressed replication payloads. */
-#define REPLICA_CAPA_INBAND_REPL_STR "inband-repl"             /* Supports RDB_OPCODE_UPDATE for inline replication. */
 
 /* Replica requirements */
 #define REPLICA_REQ_NONE 0
@@ -1005,7 +1003,6 @@ typedef struct functionsLibCtx functionsLibCtx;
 typedef struct rdbLoadingCtx {
     serverDb **dbarray;
     functionsLibCtx *functions_lib_ctx;
-    client *update_client; /* Fake client for executing inline replication commands during RDB load. */
 } rdbLoadingCtx;
 
 typedef sds (*rdbAuxFieldEncoder)(int flags);
@@ -1357,13 +1354,9 @@ typedef struct ClientReplicationData {
     int replica_version;                   /* Version on the form 0xMMmmpp. */
     unsigned long long tot_rdb_bytes_sent; /* Total RDB bytes sent to replica sockets. */
     short replica_capa;                    /* Replica capabilities: REPLICA_CAPA_* bitwise OR. */
-    int stop_send_data_until_ack;          /* Stop sending data to this replica until ACK received. */
     int using_cob;                         /* Networking uses private COB instead of shared repl buffer. */
     _Atomic(int) forkless_pending_close;   /* Main thread asks the forkless save to hand this replica
                                             * back for closing. Atomic (relaxed) since both threads access it without a lock. */
-    size_t cob_pause_bufpos;               /* COB pause position: bufpos to drain to before suspending. */
-    listNode *cob_pause_tail;              /* COB pause position: last reply list node to drain. */
-    size_t cob_pause_objlen;               /* COB pause position: bytes to drain from tail node. */
     short replica_req;                     /* Replica requirements: REPLICA_REQ_* */
     uint64_t associated_rdb_client_id;     /* The client id of this replica's rdb connection */
     time_t rdb_client_disconnect_time;     /* Time of the first freeClient call on this client. Used for delaying free. */
@@ -2360,8 +2353,6 @@ struct valkeyServer {
     int repl_replica_lazy_flush;                   /* Lazy FLUSHALL before loading DB? */
     monotime repl_full_sync_start_time;            /* Monotonic time when full sync started. */
     long long repl_full_sync_complete_duration_ms; /* Duration of the last successful full sync in ms. */
-    int wait_for_psync_offset;                     /* Replica waiting for REPLCONF psync-offset. */
-    int skip_psync_offset;                         /* Skip psync-offset command in repl backlog. */
     /* Import Mode */
     int import_mode; /* If true, server is in import mode and forbid expiration and eviction. */
     /* Synchronous replication. */
@@ -2764,13 +2755,6 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  * This is the meaning of the flags:
  *
  * CMD_WRITE:       Write command (may modify the key space).
- *                  WARNING: a command marked CMD_WRITE (or CMD_MAY_REPLICATE)
- *                  is accepted by the RDB inline-replication opcode
- *                  (RDB_OPCODE_UPDATE) and will be executed through a fake
- *                  client, with ACL checks bypassed, when such an RDB is
- *                  loaded - including a persisted dump.rdb or AOF preamble, not
- *                  only a live replication stream. Only mark a command with
- *                  these flags if it is safe to run unconditionally on load.
  *
  * CMD_READONLY:    Commands just reading from keys without changing the content.
  *                  Note that commands that don't read from the keyspace such as
@@ -2821,11 +2805,6 @@ typedef int *commandDbIdArgs(robj **argv, int argc, int *count);
  *                      EVAL, which may execute write commands, which are replicated,
  *                      or may just execute read commands. A command cannot be marked
  *                      both CMD_WRITE and CMD_MAY_REPLICATE
- *                      WARNING: like CMD_WRITE, a command marked CMD_MAY_REPLICATE
- *                      is accepted by the RDB inline-replication opcode and runs
- *                      on load through a fake client with ACL checks bypassed. Only
- *                      mark a command with it if it is safe to run unconditionally
- *                      on load.
  *
  * CMD_SENTINEL:    This command is present in sentinel mode.
  *
@@ -3468,8 +3447,6 @@ void resizeReplicationBacklog(void);
 void replicationSetPrimary(char *ip, int port, int full_sync_required, bool disconnect_blocked);
 void replicationUnsetPrimary(void);
 void refreshGoodReplicasCount(void);
-void resumeReplicaCobFlush(client *replica);
-void computeCobFlushStopPosition(client *c, listNode **block, size_t *bufpos);
 void pauseCobSendAtCurrentPositionForAck(client *c);
 int checkGoodReplicasStatus(void);
 void processClientsWaitingReplicas(void);

@@ -1382,14 +1382,6 @@ ssize_t rdbSaveAuxFieldStrInt(rio *rdb, char *key, long long val) {
 }
 
 /* Save a few default AUX fields with information about the RDB generated. */
-int rdbSaveInfoReplAuxFields(rio *rdb, rdbSaveInfo *rsi) {
-    serverAssert(rsi != NULL);
-    if (rdbSaveAuxFieldStrInt(rdb, "repl-stream-db", rsi->repl_stream_db) == -1) return -1;
-    if (rdbSaveAuxFieldStrStr(rdb, "repl-id", server.replid) == -1) return -1;
-    if (rdbSaveAuxFieldStrInt(rdb, "repl-offset", server.primary_repl_offset) == -1) return -1;
-    return 1;
-}
-
 int rdbSaveInfoAuxFields(rio *rdb, int rdbflags, rdbSaveInfo *rsi) {
     int redis_bits = (sizeof(void *) == 8) ? 64 : 32;
     int aof_base = (rdbflags & RDBFLAGS_AOF_PREAMBLE) != 0;
@@ -3732,167 +3724,6 @@ done:
     return res;
 }
 
-/* Adapts rioRead to the read_fn signature used by parseRespCommandFromReader. */
-static size_t rdbRioReader(void *ctx, void *buf, size_t len) {
-    return rioRead((rio *)ctx, buf, len);
-}
-
-/* Read a RESP multi-bulk header (*<argc>\r\n) through read_fn and return the
- * argument count in *argc_out.
- *
- * read_fn must read exactly len bytes into buf and return len on success or 0
- * on failure (same contract as rioRead). ctx is passed back untouched so the
- * source (rio, FILE, ...) is opaque to this parser.
- *
- * Returns RESP_PARSE_OK with *argc_out set, RESP_PARSE_EOF if the bytes could
- * not be read, or RESP_PARSE_FMTERR if the header is malformed. */
-static respParseResult parseRespHeaderFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx, int *argc_out) {
-    char buf[128];
-
-    if (read_fn(ctx, buf, 1) == 0) return RESP_PARSE_EOF;
-    if (buf[0] != '*') return RESP_PARSE_FMTERR;
-    int pos = 0;
-    int found_newline = 0;
-    while (pos < (int)sizeof(buf) - 1) {
-        if (read_fn(ctx, buf + pos, 1) == 0) return RESP_PARSE_EOF;
-        if (buf[pos] == '\n') {
-            found_newline = 1;
-            break;
-        }
-        pos++;
-    }
-    if (!found_newline) return RESP_PARSE_FMTERR;
-    buf[pos] = '\0'; /* overwrite \n; buf may have a trailing \r */
-    char *endptr;
-    long argc = strtol(buf, &endptr, 10);
-    /* strtol leaves endptr at the start when it parsed no digits at all. */
-    int parsed_no_digits = (endptr == buf);
-    if (parsed_no_digits || argc < 1 || argc > 1024 * 1024) return RESP_PARSE_FMTERR;
-    *argc_out = (int)argc;
-    return RESP_PARSE_OK;
-}
-
-/* Read argc RESP arguments ($<len>\r\n<data>\r\n each) through read_fn into a
- * freshly allocated argv, returned in *argv_out. The caller must already know
- * argc (see parseRespHeaderFromReader) and owns argv and its objects on OK.
- *
- * read_fn has the same contract as in parseRespHeaderFromReader. Returns
- * RESP_PARSE_OK, RESP_PARSE_EOF, or RESP_PARSE_FMTERR; on error any partial
- * allocation is freed and *argv_out is left untouched. */
-respParseResult parseRespArgsFromReader(size_t (*read_fn)(void *ctx, void *buf, size_t len), void *ctx, int argc, robj ***argv_out) {
-    char buf[128];
-    int j;
-    respParseResult result;
-
-    robj **argv = ztrymalloc(sizeof(robj *) * argc);
-    /* argc is bounded by parseRespHeaderFromReader, but allocation can still fail
-     * under memory pressure; fail the load cleanly rather than crashing. */
-    if (argv == NULL) return RESP_PARSE_FMTERR;
-    for (j = 0; j < argc; j++) {
-        if (read_fn(ctx, buf, 1) == 0) {
-            result = RESP_PARSE_EOF;
-            goto err;
-        }
-        if (buf[0] != '$') {
-            result = RESP_PARSE_FMTERR;
-            goto err;
-        }
-        int pos = 0;
-        int found_newline = 0;
-        while (pos < (int)sizeof(buf) - 1) {
-            if (read_fn(ctx, buf + pos, 1) == 0) {
-                result = RESP_PARSE_EOF;
-                goto err;
-            }
-            if (buf[pos] == '\n') {
-                found_newline = 1;
-                break;
-            }
-            pos++;
-        }
-        /* An over-long bulk-length line is malformed and would desync the stream. */
-        if (!found_newline) {
-            result = RESP_PARSE_FMTERR;
-            goto err;
-        }
-        buf[pos] = '\0';
-        char *endptr;
-        long len = strtol(buf, &endptr, 10);
-        /* strtol leaves endptr at the start when it parsed no digits at all. */
-        int parsed_no_digits = (endptr == buf);
-        /* Reject non-numeric, negative, or oversized lengths before allocating:
-         * a negative len becomes a huge size_t and a positive one past
-         * proto-max-bulk-len would otherwise abort the process on allocation. */
-        if (parsed_no_digits || len < 0 || len > server.proto_max_bulk_len) {
-            result = RESP_PARSE_FMTERR;
-            goto err;
-        }
-
-        sds argsds = sdstrynewlen(SDS_NOINIT, len);
-        if (argsds == NULL) {
-            result = RESP_PARSE_FMTERR;
-            goto err;
-        }
-        if (len && read_fn(ctx, argsds, len) == 0) {
-            sdsfree(argsds);
-            result = RESP_PARSE_EOF;
-            goto err;
-        }
-        argv[j] = createObject(OBJ_STRING, argsds);
-
-        /* Discard the trailing \r\n, validating it is exactly \r\n. */
-        char crlf[2];
-        if (read_fn(ctx, crlf, 2) == 0) {
-            j++; /* argv[j] was assigned above; free it too. */
-            result = RESP_PARSE_EOF;
-            goto err;
-        }
-        if (crlf[0] != '\r' || crlf[1] != '\n') {
-            j++; /* argv[j] was assigned above; free it too. */
-            result = RESP_PARSE_FMTERR;
-            goto err;
-        }
-    }
-
-    *argv_out = argv;
-    return RESP_PARSE_OK;
-
-err:
-    for (int k = 0; k < j; k++) decrRefCount(argv[k]);
-    zfree(argv);
-    return result;
-}
-
-/* SWAPDB replayed during a swapdb-mode diskless load must be applied to the
- * databases being loaded, not the live server.db, so swap their data fields
- * directly here. Returns 1 if this was a swapdb-mode SWAPDB and has been handled
- * (argv is freed), or 0 otherwise (not swapdb mode or not a SWAPDB; the caller
- * should replay argv normally and argv is left untouched). */
-static int tryHandleInlineSwapdbForTempLoad(rdbLoadingCtx *rdb_loading_ctx, robj **argv, int argc) {
-    /* Validate we are in swapdb mode: only that mode loads into a temporary
-     * database array (dbarray) distinct from the live server.db. */
-    if (rdb_loading_ctx->dbarray == server.db) return 0;
-
-    struct serverCommand *cmd = lookupCommand(argv, argc);
-    if (cmd->proc != swapdbCommand) return 0;
-
-    /* Parse and validate the two db ids. No ACL check is needed here: this is an
-     * internal replication replay, not a client command. A no-op swap (e.g.
-     * "swapdb 0 0") or an out-of-range/malformed one leaves nothing to do. */
-    long long id1, id2;
-    if (argc == 3 && !server.cluster_enabled && getLongLongFromObject(argv[1], &id1) == C_OK &&
-        getLongLongFromObject(argv[2], &id2) == C_OK && id1 >= 0 && id1 < server.dbnum && id2 >= 0 &&
-        id2 < server.dbnum && id1 != id2) {
-        if (rdb_loading_ctx->dbarray[id1] == NULL) rdb_loading_ctx->dbarray[id1] = createDatabase(id1);
-        if (rdb_loading_ctx->dbarray[id2] == NULL) rdb_loading_ctx->dbarray[id2] = createDatabase(id2);
-        dbSwapDataFields(rdb_loading_ctx->dbarray[id1], rdb_loading_ctx->dbarray[id2]);
-    }
-
-    for (int k = 0; k < argc; k++) decrRefCount(argv[k]);
-    zfree(argv);
-    return 1;
-}
-
 /* Load an RDB file from the rio stream 'rdb'. We return one of the following:
  * - RDB_OK On success
  * - RDB_INCOMPATIBLE If the RDB has an invalid signature or version
@@ -3957,58 +3788,10 @@ static int rdbLoadRioInternal(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadi
         if ((type = rdbLoadType(rdb)) == -1) goto eoferr;
 
         /* Safeguard for unknown foreign opcode interpretations. */
-        if (is_redis_magic && type >= RDB_FOREIGN_TYPE_MIN && type <= RDB_FOREIGN_TYPE_MAX && type != RDB_OPCODE_UPDATE) {
+        if (is_redis_magic && type >= RDB_FOREIGN_TYPE_MIN && type <= RDB_FOREIGN_TYPE_MAX) {
             serverLog(LL_WARNING, "Can't handle foreign type or opcode %d in RDB with version %d",
                       type, rdbver);
             goto loaderr;
-        }
-
-        /* Inline replication commands run on load. The opcode is honored on any
-         * load, but the embedded command is validated first: it must be a write
-         * command or one that may replicate (e.g. PUBLISH, EVAL). This prevents a
-         * crafted RDB from invoking arbitrary commands through the fake client,
-         * which bypasses ACL checks. */
-        if (type == RDB_OPCODE_UPDATE) {
-            robj **argv;
-            int argc;
-            if (parseRespHeaderFromReader(rdbRioReader, rdb, &argc) != RESP_PARSE_OK) goto eoferr;
-            if (parseRespArgsFromReader(rdbRioReader, rdb, argc, &argv) != RESP_PARSE_OK) goto eoferr;
-
-            struct serverCommand *inline_cmd = lookupCommand(argv, argc);
-            if (inline_cmd == NULL || !(inline_cmd->flags & (CMD_WRITE | CMD_MAY_REPLICATE))) {
-                serverLog(LL_WARNING,
-                          "Rejecting inline replication opcode %d: command '%s' is not a replicable write",
-                          type, (argc > 0) ? (char *)objectGetVal(argv[0]) : "<none>");
-                for (int k = 0; k < argc; k++) decrRefCount(argv[k]);
-                zfree(argv);
-                goto loaderr;
-            }
-
-            /* Edge case: SWAPDB during a swapdb-mode load must be handled
-             * separately and not through the fake client. */
-            if (tryHandleInlineSwapdbForTempLoad(rdb_loading_ctx, argv, argc)) continue;
-
-            /* Create the fake client the first time we see an inline command,
-             * then reuse it. Most loads have no inline commands, so we avoid
-             * making one until it is actually needed. */
-            if (rdb_loading_ctx->update_client == NULL) {
-                rdb_loading_ctx->update_client = createAOFClient();
-            }
-            client *fakeClient = rdb_loading_ctx->update_client;
-            fakeClient->db = db;
-
-            /* On an unknown or invalid command, stop the load. Skipping it
-             * would leave this replica with different data than the primary. */
-            sds err = NULL;
-            if (loadCommandFromArgv(fakeClient, argv, argc, 1, &err) != LOAD_CMD_OK) {
-                serverLog(LL_WARNING, "Error applying inline command from RDB stream: %s", err);
-                sdsfree(err);
-                /* loadCommandFromArgv already freed argv via the fake client. */
-                goto eoferr;
-            }
-            fakeClient->cmd = NULL;
-            /* argv was freed by loadCommandFromArgv (through the fake client). */
-            continue;
         }
 
         /* Handle special types. */
@@ -4436,12 +4219,7 @@ eoferr:
     /* fall through */
 
 cleanup:
-    /* Single exit: free the inline-command fake client (if one was created) and
-     * return the result code set by the path that jumped here. */
-    if (rdb_loading_ctx->update_client) {
-        freeClient(rdb_loading_ctx->update_client);
-        rdb_loading_ctx->update_client = NULL;
-    }
+    /* Single exit: return the result code set by the path that jumped here. */
     return ret;
 }
 
