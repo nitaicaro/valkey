@@ -1364,29 +1364,8 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
         goto error;
     }
 
-    /* Forkless socket output can only emit an unfiltered, current-version RDB
-     * (optionally whole-stream compressed). For any cohort it cannot serve,
-     * fall back to fork under 'prefer-forkless', or fail the sync under
-     * 'require-forkless' (which forbids forking). */
-    if (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS) {
-        const char *reason = NULL;
-        if (req & REPLICA_REQ_RDB_MASK) {
-            reason = "cohort needs filtered RDB content";
-        } else if (rdbver != RDB_VERSION) {
-            reason = "cohort needs a non-current RDB version";
-        }
-        if (reason != NULL) {
-            if (server.forkless_policy == FORKLESS_POLICY_REQUIRE_FORKLESS) {
-                serverLog(LL_WARNING, "Can't serve SYNC forklessly (%s) and forkless-policy 'require-forkless' "
-                                      "forbids falling back to fork",
-                          reason);
-                fail_msg = "Can't serve this full sync forklessly and forkless-policy forbids fork";
-                goto error;
-            }
-            serverLog(LL_NOTICE, "Falling back to fork-based save for SYNC: %s", reason);
-            chosen_save_type = RDB_BGSAVE_TYPE_FORK;
-        }
-    }
+    /* Forkless socket output now honors the cohort's RDB filter and version, and
+     * can whole-stream compress, so it no longer needs to fall back to fork. */
 
     serverLog(LL_NOTICE, "Starting BGSAVE for SYNC with target: %s using: %s, compression: %s, method: %s",
               (socket_target) ? "replicas sockets" : "disk",
@@ -1400,7 +1379,7 @@ int startBgsaveForReplication(int mincapa, int req, int rdbver) {
 
     if (chosen_save_type == RDB_BGSAVE_TYPE_FORKLESS) {
         if (socket_target) {
-            if (forklessSaveToSockets(sync_compression_algo) == C_ERR) {
+            if (forklessSaveToSockets(req, rdbver, sync_compression_algo) == C_ERR) {
                 fail_msg = "Can't start the forkless process for a diskless full sync";
                 goto error;
             }
