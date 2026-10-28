@@ -48,10 +48,26 @@ static mpscQueue io_shared_outbox[JOB_PRIORITY_COUNT] = {0};
 // Main -> IO (Thread-Specific) for tasks that must run on specific IO thread where IO threads check their private inbox before the shared queue
 static spscQueue io_private_inbox[IO_THREADS_MAX_NUM] = {0};
 static size_t io_jobs_submitted;
-static _Atomic(size_t) io_jobs_finished;
+/* Every IO thread adds to io_jobs_finished after each busy loop iteration. The wrapper gives
+ * it a cache line of its own, so those updates don't invalidate the line holding the
+ * main-thread-only state next to it (e.g. io_jobs_submitted). */
+typedef struct {
+    _Alignas(CACHE_LINE_SIZE) _Atomic(size_t) value;
+} io_jobs_finished_counter;
+static_assert(sizeof(io_jobs_finished_counter) == CACHE_LINE_SIZE, "io_jobs_finished must occupy exactly one cache line");
+static io_jobs_finished_counter io_jobs_finished;
 static size_t cluster_io_pending_responses;
 static int io_threads_initialized = 0;
-_Atomic long long used_active_time_io_thread[IO_THREADS_MAX_NUM] = {0};
+/* Set during process exit to stop worker response retries. */
+static _Atomic int io_threads_exiting = 0;
+/* Each IO thread adds to its own slot on every busy loop iteration, so each slot gets a cache
+ * line of its own to keep one thread's update from invalidating its neighbours' slots
+ * (false sharing). Only INFO reads these. */
+typedef struct {
+    _Alignas(CACHE_LINE_SIZE) _Atomic long long value;
+} io_thread_active_time;
+static_assert(sizeof(io_thread_active_time) == CACHE_LINE_SIZE, "each used_active_time_io_thread slot must occupy exactly one cache line");
+static io_thread_active_time used_active_time_io_thread[IO_THREADS_MAX_NUM];
 
 /* Job Types for Tagged Pointers
  * We use the lower 3 bits of the pointer to store the job type.
@@ -95,7 +111,7 @@ void commitIOJobs(void) {
 
 /* Jobs sent but not yet processed by IO threads. */
 static size_t getPendingIOThreadsJobs(void) {
-    return io_jobs_submitted - atomic_load_explicit(&io_jobs_finished, memory_order_acquire);
+    return io_jobs_submitted - atomic_load_explicit(&io_jobs_finished.value, memory_order_acquire);
 }
 
 /* Read/write jobs awaiting response from IO threads. */
@@ -279,7 +295,10 @@ static void flushPendingIOResponsesList(list **pending_list, mpscQueue *outbox, 
         /* Try to enqueue. If blocking is set, retry until success. */
         do {
             pushed = mpscEnqueue(outbox, job, ticket);
-            if (pushed || !blocking || server.crashed) break; /* On server crash we kill the IO threads, no point in sending back jobs to the main-thread. */
+            /* The main thread does not consume responses during crash or exit. */
+            if (pushed || !blocking || server.crashed ||
+                atomic_load_explicit(&io_threads_exiting, memory_order_acquire))
+                break;
             atomic_thread_fence(memory_order_acquire);
         } while (true);
 
@@ -306,6 +325,14 @@ void cleanupThreadResources(void *dummy) {
 
     /* Blocking flush: ensure all pending jobs are sent before thread dies */
     flushPendingIOResponses(1);
+
+    /* Release response lists left when the flush stops early. */
+    for (int i = 0; i < JOB_PRIORITY_COUNT; i++) {
+        if (pending_io_responses[i]) {
+            listRelease(pending_io_responses[i]);
+            pending_io_responses[i] = NULL;
+        }
+    }
 
     /* Free the shared query buffer */
     freeSharedQueryBuf();
@@ -354,10 +381,10 @@ static void *IOThreadMain(void *myid) {
     snprintf(thdname, sizeof(thdname), "io_thd_%ld", id);
     valkey_set_thread_title(thdname);
     serverSetCpuAffinity(server.server_cpulist);
+    thread_id = (int)id;
     initSharedQueryBuf();
     pthread_cleanup_push(cleanupThreadResources, NULL);
 
-    thread_id = (int)id;
     void *batch_jobs[BATCH_SIZE];
     int processed = 0;
     monotime work_start_time = 0;
@@ -368,7 +395,7 @@ static void *IOThreadMain(void *myid) {
         monotime prev_work_start_time = work_start_time;
         work_start_time = getMonotonicUs();
         if (processed != 0) {
-            atomic_fetch_add_explicit(&used_active_time_io_thread[id],
+            atomic_fetch_add_explicit(&used_active_time_io_thread[id].value,
                                       work_start_time - prev_work_start_time,
                                       memory_order_relaxed);
         }
@@ -408,7 +435,7 @@ static void *IOThreadMain(void *myid) {
         }
 
         if (processed) {
-            atomic_fetch_add_explicit(&io_jobs_finished, processed, memory_order_release);
+            atomic_fetch_add_explicit(&io_jobs_finished.value, processed, memory_order_release);
         }
 
         /* If both queues were empty (no processing done), wait for signal. */
@@ -431,7 +458,7 @@ static void *IOThreadMain(void *myid) {
 }
 
 long long getIOThreadActiveTimeMicroseconds(int id) {
-    return atomic_load_explicit(&used_active_time_io_thread[id], memory_order_relaxed);
+    return atomic_load_explicit(&used_active_time_io_thread[id].value, memory_order_relaxed);
 }
 
 static void createIOThread(int id) {
@@ -471,18 +498,50 @@ static void shutdownIOThread(int id) {
     pthread_cancel(tid);
 
     if ((err = pthread_join(tid, NULL)) != 0) {
-        serverLog(LL_WARNING, "IO thread(tid:%lu) can not be joined: %s", (unsigned long)tid, strerror(err));
+        serverLog(LL_WARNING, "IO thread(tid:%lu) cannot be joined: %s", (unsigned long)tid, strerror(err));
     } else {
         serverLog(LL_NOTICE, "IO thread(tid:%lu) terminated", (unsigned long)tid);
+        if (!server.crashed) debugServerAssert(!isSharedQueryBufRegistered(id));
     }
     pthread_mutex_destroy(&io_threads_mutex[id]);
+
+    /* The joined worker's inbox may contain uncommitted JOB_SPSC_FREE_ARGV jobs. */
+    if (!server.crashed) {
+        spscCommit(&io_private_inbox[id]);
+        void *batch[BATCH_SIZE];
+        size_t batch_count;
+        size_t drained = 0;
+        while ((batch_count = spscDequeueBatch(&io_private_inbox[id], batch, BATCH_SIZE)) > 0) {
+            for (size_t i = 0; i < batch_count; i++) {
+                void *data;
+                int type;
+                untagJob(batch[i], &data, &type);
+                switch (type) {
+                case JOB_SPSC_FREE_ARGV:
+                    ioThreadFreeArgv((robj **)data);
+                    break;
+                case JOB_SPSC_POLL:
+                    serverAssert(atomic_load_explicit(&io_threads_exiting, memory_order_acquire));
+                    break;
+                default:
+                    serverPanic("Invalid SPSC job type: %d", type);
+                }
+            }
+            drained += batch_count;
+        }
+        if (drained) atomic_fetch_add_explicit(&io_jobs_finished.value, drained, memory_order_release);
+    }
+
     spscFree(&io_private_inbox[id]);
 }
 
 void killIOThreads(void) {
+    /* The main thread does not consume responses while joining workers. */
+    atomic_store_explicit(&io_threads_exiting, 1, memory_order_release);
     for (int j = 1; j < server.io_threads_num; j++) { /* We don't kill thread 0, which is the main thread. */
         shutdownIOThread(j);
     }
+    server.active_io_threads_num = 1;
 }
 
 int updateIOThreads(const char **err) {
@@ -553,7 +612,7 @@ void initIOThreads(int prev_threads_num) {
             mpscInit(&io_shared_outbox[p], IO_MPSC_QUEUE_SIZE);
         }
         io_jobs_submitted = 0;
-        atomic_init(&io_jobs_finished, 0);
+        atomic_init(&io_jobs_finished.value, 0);
         cluster_io_pending_responses = 0;
         prefetchCommandsBatchInit();
         io_threads_initialized = 1;
@@ -578,7 +637,7 @@ void testOnlyInitIOThreadQueues(void) {
         io_thread_ticket[p] = (mpscTicket){0};
     }
     io_jobs_submitted = 0;
-    atomic_store_explicit(&io_jobs_finished, 0, memory_order_relaxed);
+    atomic_store_explicit(&io_jobs_finished.value, 0, memory_order_relaxed);
     cluster_io_pending_responses = 0;
 }
 
@@ -593,7 +652,7 @@ void testOnlyFreeIOThreadQueues(void) {
         io_thread_ticket[p] = (mpscTicket){0};
     }
     io_jobs_submitted = 0;
-    atomic_store_explicit(&io_jobs_finished, 0, memory_order_relaxed);
+    atomic_store_explicit(&io_jobs_finished.value, 0, memory_order_relaxed);
     cluster_io_pending_responses = 0;
 }
 
@@ -613,6 +672,24 @@ size_t testOnlyGetClusterIOPendingResponses(void) {
     return cluster_io_pending_responses;
 }
 
+/* Addresses of the IO thread counters, so unit tests can check their cache line layout. */
+const void *testOnlyGetIOThreadActiveTimeSlot(int id) {
+    return &used_active_time_io_thread[id].value;
+}
+
+const void *testOnlyGetIOJobsFinishedCounter(void) {
+    return &io_jobs_finished.value;
+}
+
+const void *testOnlyGetIOJobsSubmittedCounter(void) {
+    return &io_jobs_submitted;
+}
+
+/* This function attempts to offload the client's read to an I/O thread.
+ * Returns C_OK if the read was offloaded, or if an I/O thread is already reading
+ * or writing for this client, so the main thread must not read now.
+ * Returns C_ERR if the client is not eligible for offloading, or the job queue
+ * is full, and the main thread should read the client itself. */
 int trySendReadToIOThreads(client *c) {
     if (server.active_io_threads_num <= 1) return C_ERR;
     /* Fake/teardown clients may have no connection; never offload those. */
@@ -625,9 +702,10 @@ int trySendReadToIOThreads(client *c) {
     if (c->io_write_state == CLIENT_PENDING_IO) return C_OK;
     /* For simplicity, don't offload replica clients reads as read traffic from replica is negligible */
     if (getClientType(c) == CLIENT_TYPE_REPLICA) return C_ERR;
-    /* A live replication stream reader must run on the main thread; the IO-thread
-     * read path does not decode. Destroyed once the probe resolves to plaintext. */
-    if (c->flag.primary && server.repl_stream_reader) return C_ERR;
+    /* Keep the primary link on the main thread: readQueryFromClient drains multiple
+     * full reads per event before serving other clients, and the IO-thread read path
+     * does not decode the replication stream. */
+    if (c->flag.primary) return C_ERR;
     /* With Lua debug client we may call connWrite directly in the main thread */
     if (c->flag.lua_debug) return C_ERR;
     /* For simplicity let the main-thread handle the blocked clients */

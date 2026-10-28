@@ -208,7 +208,7 @@ void dbUpdateObjectWithVolatileItemsTracking(serverDb *db, robj *o) {
  * function.
  *
  * If the update_if_existing argument is false, the program is aborted
- * if the key already exists, otherwise, it can fall back to dbOverwrite. */
+ * if the key already exists; otherwise, it can fall back to dbOverwrite. */
 static void dbAddInternal(serverDb *db, robj *key, robj **valref, int update_if_existing) {
     int dict_index = getKVStoreIndexUsingCachedSlot(objectGetVal(key));
     void **oldref = NULL;
@@ -266,7 +266,9 @@ int getCachedKeySlot(sds key) {
      * so we must always recompute the slot for commands coming from the primary or AOF.
      */
     if (server.current_client && server.current_client->slot >= 0 && server.current_client->flag.executing_command &&
-        !mustObeyClient(server.current_client)) {
+        !mustObeyClient(server.current_client) &&
+        server.current_client->cmd &&
+        !(server.current_client->cmd->flags & (CMD_MODULE | CMD_TOUCHES_ARBITRARY_KEYS))) {
         debugServerAssertWithInfo(server.current_client, NULL,
                                   (int)keyHashSlot(key, (int)sdslen(key)) == server.current_client->slot);
         return server.current_client->slot;
@@ -289,7 +291,7 @@ int getCachedKeySlot(sds key) {
  * give more control to the caller, nor will signal the key as ready
  * since it is not useful in this context.
  *
- * The function returns 1 if the key was added to the database, otherwise 0 is returned.
+ * The function returns 1 if the key was added to the database; otherwise, 0 is returned.
  */
 int dbAddRDBLoad(serverDb *db, sds key, robj **valref) {
     int dict_index = getKVStoreIndexForKey(key);
@@ -822,7 +824,7 @@ void signalFlushedDb(int dbid, int async) {
  * async: flushes the database in an async manner.
  * no option: determine sync or async according to the value of lazyfree-lazy-user-flush.
  *
- * On success the C_OK is returned, otherwise C_ERR is returned. */
+ * On success the C_OK is returned; otherwise, C_ERR is returned. */
 int parseFlushCommandFlags(client *c, int *flags) {
     /* Parse the optional ASYNC option. */
     if (c->argc == 2 && !strcasecmp(objectGetVal(c->argv[1]), "sync")) {
@@ -1084,14 +1086,11 @@ void keysScanCallback(void *privdata, void *entry, int didx) {
     addScanDataItem(data->result, (const char *)key, sdslen(key));
 }
 
-/* This callback is used by scanGenericCommand in order to collect elements
- * returned by the dictionary iterator into a list. */
+/* Collect borrowed keys and values for SET and HASH hashtable scans. */
 void hashtableScanCallback(void *privdata, void *entry) {
     scanData *data = (scanData *)privdata;
     stringRef val = {NULL, 0};
     sds key = NULL;
-    const char *zset_ptr = NULL;
-    size_t zset_ele_len = 0;
 
     robj *o = data->o;
     data->sampled++;
@@ -1103,9 +1102,6 @@ void hashtableScanCallback(void *privdata, void *entry) {
     /* get key, value */
     if (o->type == OBJ_SET) {
         key = (sds)entry;
-    } else if (o->type == OBJ_ZSET) {
-        orderedIndexItemGetElement((const OrderedIndexItem *)entry, &zset_ptr, &zset_ele_len);
-        /* zset data is copied after filtering */
     } else if (objectGetType(o) == OBJ_HASH) {
         key = entryGetField(entry);
         if (!data->only_keys) {
@@ -1117,27 +1113,8 @@ void hashtableScanCallback(void *privdata, void *entry) {
 
     /* Filter element if it does not match the pattern. */
     if (data->pattern) {
-        const char *match_ptr = (o->type == OBJ_ZSET) ? zset_ptr : key;
-        size_t match_len = (o->type == OBJ_ZSET) ? zset_ele_len : sdslen(key);
-        if (!stringmatchlen(data->pattern, sdslen(data->pattern), match_ptr, match_len, 0)) {
+        if (!stringmatchlen(data->pattern, sdslen(data->pattern), key, sdslen(key), 0)) {
             return;
-        }
-    }
-
-    /* zset data must be copied. Do this after filtering to avoid unneeded
-     * allocations. */
-    if (o->type == OBJ_ZSET) {
-        /* zset data is copied */
-        const char *ptr;
-        size_t ele_len;
-        orderedIndexItemGetElement((const OrderedIndexItem *)entry, &ptr, &ele_len);
-        key = sdsnewlen(ptr, ele_len);
-        if (!data->only_keys) {
-            char buf[MAX_LONG_DOUBLE_CHARS];
-            int len = ld2string(buf, sizeof(buf), orderedIndexItemGetScore((const OrderedIndexItem *)entry), LD_STR_AUTO);
-            sds tmp = sdsnewlen(buf, len);
-            val.buf = (const char *)tmp;
-            val.len = sdslen(tmp);
         }
     }
 
@@ -1145,6 +1122,24 @@ void hashtableScanCallback(void *privdata, void *entry) {
     if (val.buf) {
         addScanDataItem(data->result, val.buf, val.len);
     }
+}
+
+/* Keep stable ZSET item pointers until the reply is written, avoiding member
+ * and score copies during the scan. */
+static void zsetScanReferenceCallback(void *privdata, void *entry) {
+    scanData *data = privdata;
+    data->sampled++;
+    if (data->pattern) {
+        const char *element;
+        size_t len;
+        orderedIndexItemGetElement(entry, &element, &len);
+        if (data->pattern && !stringmatchlen(data->pattern, sdslen(data->pattern), element, len, 0)) return;
+    } else {
+        /* Warm the item for the reply without loading its length twice. */
+        valkey_prefetch(entry);
+    }
+    OrderedIndexItem **item = vectorPush(data->result);
+    *item = entry;
 }
 
 /* Try to parse a SCAN cursor stored at buffer 'buf':
@@ -1256,7 +1251,7 @@ int parseScanOptionsOrReply(client *c, robj *o, int start_idx, bool allow_slot, 
 }
 
 /* This command implements SCAN, HSCAN, SSCAN and CLUSTERSCAN commands.
- * If object 'o' is passed, then it must be a Hash, Set or Zset object, otherwise
+ * If object 'o' is passed, then it must be a Hash, Set or Zset object; otherwise,
  * if 'o' is NULL the command will operate on the dictionary associated with
  * the current database.
  *
@@ -1285,9 +1280,8 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
 
     /* Handle the case of kvstore, dict or hashtable. */
     hashtable *ht = NULL;
-    /* Set a free callback for the contents of the collected keys list if they
-     * are deep copied temporary strings. We must not free them if they are just
-     * a shallow copy - a pointer to the actual data in the data structure */
+    int use_zset_item_refs = 0;
+    /* Free temporary strings from compact encodings. */
     void (*free_callback)(sds) = sdsfree;
     if (o == NULL) {
         free_callback = NULL;
@@ -1300,10 +1294,10 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
     } else if (o->type == OBJ_ZSET && o->encoding == OBJ_ENCODING_BTREE) {
         zset *zs = objectGetVal(o);
         ht = zs->ht;
-        /* scanning ZSET allocates temporary strings even though it's a dict */
-        free_callback = sdsfree;
+        free_callback = NULL;
+        use_zset_item_refs = 1;
     }
-    vectorInit(&result, SCAN_VECTOR_INITIAL_ALLOC, sizeof(stringRef));
+    vectorInit(&result, SCAN_VECTOR_INITIAL_ALLOC, use_zset_item_refs ? sizeof(OrderedIndexItem *) : sizeof(stringRef));
 
     /* For main hash table scan or scannable data structure. */
     if (!o || ht) {
@@ -1322,7 +1316,7 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
          * 4. data.pattern: the pattern string;
          * 5. data.sampled: the maxiteration limit is there in case we're
          * working on an empty dict, one with a lot of empty buckets, and
-         * for the buckets are not empty, we need to limit the spampled number
+         * for the buckets are not empty, we need to limit the sampled number
          * to prevent a long hang time caused by filtering too many keys;
          * 6. data.only_keys: to control whether values will be returned or
          * only keys are returned. */
@@ -1352,7 +1346,8 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
             if (o == NULL) {
                 cursor = kvstoreScan(c->db->keys, cursor, slot, final_slot, keysScanCallback, NULL, &data);
             } else {
-                cursor = hashtableScan(ht, cursor, hashtableScanCallback, &data);
+                cursor = hashtableScan(ht, cursor,
+                                       use_zset_item_refs ? zsetScanReferenceCallback : hashtableScanCallback, &data);
             }
         } while (cursor && maxiterations-- && data.sampled < opts->count);
     } else if (o->type == OBJ_SET) {
@@ -1427,12 +1422,25 @@ void scanGenericCommandWithOptions(client *c, robj *o, unsigned long long cursor
         addReplyBulkLongLong(c, cursor);
     }
 
-    addReplyArrayLen(c, vectorLen(&result));
-    for (uint32_t i = 0; i < vectorLen(&result); i++) {
-        stringRef *key = vectorGet(&result, i);
-        addReplyBulkCBuffer(c, key->buf, key->len);
-        if (free_callback) {
-            free_callback((sds)(key->buf));
+    if (use_zset_item_refs) {
+        addReplyArrayLen(c, (long)vectorLen(&result) * (opts->only_keys ? 1 : 2));
+        for (uint32_t i = 0; i < vectorLen(&result); i++) {
+            OrderedIndexItem *item = *(OrderedIndexItem **)vectorGet(&result, i);
+            const char *element;
+            size_t len;
+            orderedIndexItemGetElement(item, &element, &len);
+            addReplyBulkCBuffer(c, element, len);
+            if (opts->only_keys) continue;
+            char buf[MAX_LONG_DOUBLE_CHARS];
+            int score_len = ld2string(buf, sizeof(buf), orderedIndexItemGetScore(item), LD_STR_AUTO);
+            addReplyBulkCBuffer(c, buf, score_len);
+        }
+    } else {
+        addReplyArrayLen(c, vectorLen(&result));
+        for (uint32_t i = 0; i < vectorLen(&result); i++) {
+            stringRef *key = vectorGet(&result, i);
+            addReplyBulkCBuffer(c, key->buf, key->len);
+            if (free_callback) free_callback((sds)(key->buf));
         }
     }
 
@@ -1809,20 +1817,44 @@ static void copyDbExpiry(serverDb *target, const serverDb *source) {
     memcpy(target->expiry, source->expiry, sizeof(target->expiry));
 }
 
+/* Swap hash tables. Note that we don't swap blocking_keys, ready_keys and
+ * watched_keys, since we want clients to remain in the same DB they were. */
+void dbSwapDataFields(serverDb *db1, serverDb *db2) {
+    serverDb aux = *db1;
+
+    db1->keys = db2->keys;
+    db1->expires = db2->expires;
+    db1->keys_with_volatile_items = db2->keys_with_volatile_items;
+    copyDbExpiry(db1, db2);
+
+    db2->keys = aux.keys;
+    db2->expires = aux.expires;
+    db2->keys_with_volatile_items = aux.keys_with_volatile_items;
+    copyDbExpiry(db2, &aux);
+}
+
+void swapMainDbDataWithTempDb(serverDb **tempDb) {
+    for (int i = 0; i < server.dbnum; i++) {
+        if (tempDb[i] == NULL && server.db[i] == NULL) continue;
+        if (tempDb[i] == NULL) tempDb[i] = createDatabase(i);
+        if (server.db[i] == NULL) server.db[i] = createDatabase(i);
+        dbSwapDataFields(server.db[i], tempDb[i]);
+    }
+}
+
 /* Swap two databases at runtime so that all clients will magically see
  * the new database even if already connected. Note that the client
  * structure c->db points to a given DB, so we need to be smarter and
- * swap the underlying referenced structures, otherwise we would need
+ * swap the underlying referenced structures; otherwise, we would need
  * to fix all the references to the DB structure.
  *
- * Returns C_ERR if at least one of the DB ids are out of range, otherwise
+ * Returns C_ERR if at least one of the DB ids are out of range; otherwise,
  * C_OK is returned. */
 int dbSwapDatabases(int id1, int id2) {
     if (id1 < 0 || id1 >= server.dbnum || id2 < 0 || id2 >= server.dbnum) return C_ERR;
     if (id1 == id2) return C_OK;
     serverDb *db1 = createDatabaseIfNeeded(id1);
     serverDb *db2 = createDatabaseIfNeeded(id2);
-    serverDb aux = *db1;
 
     /* Swapdb should make transaction fail if there is any
      * client watching keys */
@@ -1833,19 +1865,7 @@ int dbSwapDatabases(int id1, int id2) {
     scanDatabaseForDeletedKeys(db1, db2);
     scanDatabaseForDeletedKeys(db2, db1);
 
-    /* Swap hash tables. Note that we don't swap blocking_keys,
-     * ready_keys and watched_keys, since we want clients to
-     * remain in the same DB they were. */
-    db1->keys = db2->keys;
-    db1->expires = db2->expires;
-    db1->keys_with_volatile_items = db2->keys_with_volatile_items;
-    copyDbExpiry(db1, db2);
-
-
-    db2->keys = aux.keys;
-    db2->expires = aux.expires;
-    db2->keys_with_volatile_items = aux.keys_with_volatile_items;
-    copyDbExpiry(db2, &aux);
+    dbSwapDataFields(db1, db2);
 
     /* Now we need to handle clients blocked on lists: as an effect
      * of swapping the two DBs, a client that was waiting for list
@@ -1869,7 +1889,6 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         if (tempDb[i] == NULL && server.db[i] == NULL) continue;
         if (tempDb[i] == NULL) tempDb[i] = createDatabase(i);
         if (server.db[i] == NULL) server.db[i] = createDatabase(i);
-        serverDb aux = *server.db[i];
         serverDb *activedb = server.db[i], *newdb = tempDb[i];
 
         /* Swapping databases should make transaction fail if there is any
@@ -1879,18 +1898,7 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
         /* Try to unblock any XREADGROUP clients if the key no longer exists. */
         scanDatabaseForDeletedKeys(activedb, newdb);
 
-        /* Swap hash tables. Note that we don't swap blocking_keys,
-         * ready_keys and watched_keys, since clients
-         * remain in the same DB they were. */
-        activedb->keys = newdb->keys;
-        activedb->expires = newdb->expires;
-        activedb->keys_with_volatile_items = newdb->keys_with_volatile_items;
-        copyDbExpiry(activedb, newdb);
-
-        newdb->keys = aux.keys;
-        newdb->expires = aux.expires;
-        newdb->keys_with_volatile_items = aux.keys_with_volatile_items;
-        copyDbExpiry(newdb, &aux);
+        dbSwapDataFields(activedb, newdb);
 
         /* Now we need to handle clients blocked on lists: as an effect
          * of swapping the two DBs, a client that was waiting for list
@@ -1907,6 +1915,7 @@ void swapMainDbWithTempDb(serverDb **tempDb) {
     trackingInvalidateKeysOnFlush(1);
     flushReplicaKeysWithExpireList(1);
 }
+
 
 /* SWAPDB db1 db2 */
 void swapdbCommand(client *c) {
@@ -1953,11 +1962,11 @@ int removeExpire(serverDb *db, robj *key) {
 }
 
 /* Set an expire to the specified key. If the expire is set in the context
- * of a user calling a command 'c' is the client, otherwise 'c' is set
+ * of a user calling a command 'c' is the client; otherwise 'c' is set
  * to NULL. The 'when' parameter is the absolute unix time in milliseconds
  * after which the key will no longer be considered valid.
  *
- * This functions may reallocate the value. The new allocation is returned and
+ * This function may reallocate the value. The new allocation is returned and
  * the old object's reference counter is decremented and possibly freed. */
 robj *setExpire(client *c, serverDb *db, robj *key, long long when) {
     /* TODO: Add val as a parameter to this function, to avoid looking it up. */
@@ -2282,7 +2291,7 @@ static int dbExpandSkipSlot(int slot) {
 }
 
 /*
- * This functions increases size of the main/expires db to match desired number.
+ * This function increases size of the main/expires db to match desired number.
  * In cluster mode resizes all individual dictionaries for slots that this node owns.
  *
  * Based on the parameter `try_expand`, appropriate dict expand API is invoked.
@@ -2707,7 +2716,7 @@ int getKeysUsingLegacyRangeSpec(struct serverCommand *cmd, robj **argv, int argc
  * table, according to the command name in argv[0].
  *
  * This function uses the command table if a command-specific helper function
- * is not required, otherwise it calls the command-specific function. */
+ * is not required; otherwise, it calls the command-specific function. */
 int getKeysFromCommand(struct serverCommand *cmd, robj **argv, int argc, getKeysResult *result) {
     if (cmd->flags & CMD_MODULE_GETKEYS) {
         return moduleGetCommandKeysViaAPI(cmd, argv, argc, result);

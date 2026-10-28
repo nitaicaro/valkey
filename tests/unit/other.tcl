@@ -320,7 +320,7 @@ start_server {tags {"other"}} {
 
         # Reload and check
         waitForBgrewriteaof r
-        # We need to wait two seconds to avoid false positives here, otherwise
+        # We need to wait two seconds to avoid false positives here; otherwise,
         # the DEBUG LOADAOF command may read a partial file.
         # Another solution would be to set the fsync policy to no, since this
         # prevents write() to be delayed by the completion of fsync().
@@ -759,7 +759,7 @@ start_server {overrides {forkless-infrastructure-enabled yes} tags {"other" "ext
             r flushall
             r save
             r set x 10
-            r config set bgsave-default-method $bgsave_type
+            r config set forkless-policy [expr {$bgsave_type eq "forkless" ? "prefer-forkless" : "require-fork"}]
             r bgsave
             waitForBgsave r
 
@@ -774,7 +774,7 @@ start_server {overrides {forkless-infrastructure-enabled yes} tags {"other" "ext
             r flushdb
             r set x 10
             r expire x 1000
-            r config set bgsave-default-method $bgsave_type
+            r config set forkless-policy [expr {$bgsave_type eq "forkless" ? "prefer-forkless" : "require-fork"}]
             r bgsave
             waitForBgsave r
             r debug reload

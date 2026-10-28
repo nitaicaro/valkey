@@ -22,10 +22,23 @@ static bool isScriptCallWriteCmd(struct serverCommand *cmd) {
     return ((cmd->proc == fcallCommand) || (cmd->proc == evalCommand) || (cmd->proc == evalShaCommand));
 }
 
+/* Some read commands also change the internal format (not great).  We need to treat these like
+ * write commands, blocking them from modifying the format while the background thread might be
+ * operating on the item.
+ *  - PFCOUNT - modifies the underlying string (and is replicated!)
+ *  - LINDEX/LRANGE/LPOS - may modify quicklist by LZF compress/uncompress */
+static bool isFormatChangingCommand(struct serverCommand *cmd) {
+    return ((cmd->proc == pfcountCommand) ||
+            (cmd->proc == lindexCommand) ||
+            (cmd->proc == lrangeCommand) ||
+            (cmd->proc == lposCommand) ||
+            (cmd->proc == sortroCommand));
+}
+
 /* The PFCOUNT command (which does NOT have the CMD_WRITE flag) modifies the underlying string and
  * is replicated as a write.  So it needs to be detected and handled specially. */
 static bool isWriteCmd(struct serverCommand *cmd) {
-    return ((cmd->flags & CMD_WRITE) || (cmd->proc == pfcountCommand) || (cmd->proc == execCommand) || (isScriptCallWriteCmd(cmd)));
+    return ((cmd->flags & CMD_WRITE) || isFormatChangingCommand(cmd) || (cmd->proc == execCommand) || (isScriptCallWriteCmd(cmd)));
 }
 
 // Returns true if the command is a deletion based command (DEL or UNLINK)
@@ -385,6 +398,15 @@ struct bgIterator {
 
     bool cur_cmd_may_replicate; // Used only in main thread during command processing
 
+    /* When a key is deleted (expire/evict):
+     *   1. bgIteration_keyDelete() is called
+     *   2. the key is physically deleted
+     *   3. replication is generated
+     * At replication time (step 3) we need to know whether each iterator had already processed the
+     * deleted key.  keyDelete() removes the dbEntry from early_iterate_entries immediately (step 1)
+     * to avoid a dangling pointer.  This flag records if the entry was in early_iterate_entries. */
+    bool last_key_delete_was_early; // Used only in main thread during command processing
+
     // Variables maintaining runtime statistics
     unsigned long dbentries_queued;         // Updated by main thread
     unsigned long dbentries_processed;      // Updated by client thread
@@ -447,13 +469,6 @@ static uint32_t bgIteration_epoch = 1;
  * should respect the setting of cur_cmd_may_replicate. */
 static bool iteratorReplicationFlagsWereUpdated;
 
-/* When a key is deleted (expire/evict):
- *   1. bgIteration_keyDelete() is called
- *   2. the key is physically deleted
- *   3. replication is generated
- * At the time of replication, we need the (deleted) dbEntry pointer to be able to check
- * early_iterated_entries.  This variable stores the pointer from the last call of keyDelete() */
-static dbEntry *dbEntryPtrOfLastKeyDelete;
 
 /* BgIteration debug captures BgIteration activity to a large sds buffer.  When an iterator is
  * completed, the entire buffer is written to a file in the current working directory.  Note that
@@ -1879,6 +1894,7 @@ static bool anIteratorWillReplicateForThisCommand(void) {
 
 static bool expediteKeysForMultiExec(client *c, hashtable *waitingOnKeys) {
     serverAssert(c->cmd->proc == execCommand);
+    if (c->mstate == NULL) return false; // EXEC without MULTI
 
     /* For MULTI/EXEC, Valkey buffers all of the commands until hitting the EXEC.
      * At this point, the client holds all of the commands to be executed.  This function searches
@@ -2019,6 +2035,7 @@ static bgIterator *bgIteratorCreate(const char *name,
     it->completed = false;
     it->terminated = false;
     it->cur_cmd_may_replicate = false;
+    it->last_key_delete_was_early = false;
 
     it->dbentries_queued = 0;
     it->dbentries_processed = 0;
@@ -2257,8 +2274,6 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
     dbEntry *de = dbFind(server.db[dbid], (sds)key);
     serverAssert(de != NULL); // This API should be called BEFORE removal from main dict
 
-    dbEntryPtrOfLastKeyDelete = de; // save for check at replication time
-
     // For consistent iterators, we need to make sure the item gets written before delete
     listIter li;
     listNode *node;
@@ -2273,6 +2288,11 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
                 addEarlyIterationKey(it, de, dbid); // (may also add to inUseEntries)
             }
         }
+
+        /* Since the key is being removed from the main dictionary, also remove it from the
+         * early_iterate_entries (if it was there) and save the early iterate status for use during
+         * the replication of the DEL. */
+        it->last_key_delete_was_early = hashtableDelete(it->early_iterate_entries, de);
     }
 
     /* We might be within the context of a command execution.  This happens if the key is found to
@@ -2587,12 +2607,16 @@ void bgIteration_handleCommandReplication(int dbid,
                     // Here we know that the DEL is related to the running command
                     shouldReplicateDelCommand = it->cur_cmd_may_replicate;
                 } else {
-                    // Otherwise, it's something like active expiration or eviction (unrelated)
-                    if (iteratorHasPassedKey(it, dbid, key, dbEntryPtrOfLastKeyDelete)) {
+                    /* Otherwise, it's something like active expiration or eviction (unrelated).
+                     * Replicate the DEL if the iterator had already accounted for this key: either
+                     * the scan has passed its position, or it was expedited early.  The
+                     * early-expedite signal was captured into it->last_key_delete_was_early in
+                     * bgIteration_keyDelete before the entry was removed from early_iterate_entries. */
+                    if (it->keyset_iter->hasPassedItem(it->keyset_iter, key, dbid) ||
+                        it->last_key_delete_was_early) {
                         shouldReplicateDelCommand = true;
                     }
                 }
-                hashtableDelete(it->early_iterate_entries, dbEntryPtrOfLastKeyDelete); // just try delete (might not be here)
             }
         }
 

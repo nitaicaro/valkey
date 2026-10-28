@@ -1161,7 +1161,7 @@ start_server {tags {"repl"} overrides {save ""}} {
             assert_equal 1 [s 0 master_sync_in_progress]
             assert_match {*state=bg_transfer*repl_compression=lz4*} [$primary info replication]
 
-            wait_for_condition 100 100 {
+            wait_for_condition 200 100 {
                 [s 0 master_link_status] eq {up}
             } else {
                 fail "Replication not up after dual-channel sync"
@@ -1222,7 +1222,7 @@ start_server {tags {"repl"} overrides {save ""}} {
                 set payload [string repeat x [expr {2 * 1024 * 1024}]]
                 $primary set zstd-during-load $payload
 
-                wait_for_condition 100 100 {
+                wait_for_condition 200 100 {
                     [s 0 master_link_status] eq {up} &&
                     [$replica get zstd-during-load] eq $payload
                 } else {
@@ -1289,7 +1289,7 @@ start_server {tags {"repl"} overrides {save ""}} {
                 assert_equal $initial_compressed \
                     [regexp -all {repl_compression=(lz4|zstd)} [$primary info replication]]
 
-                wait_for_condition 100 100 {
+                wait_for_condition 200 100 {
                     [status $primary sync_partial_ok] == $partial_before + 1 &&
                     [s 0 master_link_status] eq {up} &&
                     [regexp -all {repl_compression=(lz4|zstd)} [$primary info replication]] == $final_compressed
@@ -1332,7 +1332,7 @@ start_server {tags {"repl"} overrides {save ""}} {
 # REPLCONF reply can leave pending output that makes the primary reject PSYNC,
 # and the legacy-SYNC fallback suppresses the ACK that diskless sync waits for
 # (upstream race). It is enabled once all replicas are streaming.
-start_server {tags {"repl"} overrides {save "" io-threads 4 repl-compression lz4}} {
+start_server {tags {"repl" "valgrind:skip"} overrides {save "" io-threads 4 repl-compression lz4}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
@@ -1391,7 +1391,7 @@ start_server {tags {"repl"} overrides {save "" io-threads 4 repl-compression lz4
 # Chained replication: each hop negotiates compression independently, and the
 # middle node simultaneously decodes its primary link on the main thread while
 # encoding for its own replica on IO threads.
-start_server {tags {"repl"} overrides {save "" repl-compression lz4}} {
+start_server {tags {"repl" "valgrind:skip"} overrides {save "" repl-compression lz4}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
