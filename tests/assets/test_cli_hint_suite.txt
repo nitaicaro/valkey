@@ -11,7 +11,7 @@
 "DECRBY " "key decrement"
 
 # Command with optional arg: INCREX
-"INCREX xyz " "[NX|XX] [EX ex|PX px|EXAT unix-time-seconds|PXAT unix-time-milliseconds] [BYINT integer|BYFLOAT float]"
+"INCREX xyz " "[NX|XX] [EX ex|PX px|EXAT unix-time-seconds|PXAT unix-time-milliseconds|PERSIST] [ENX] [BYINT integer|BYFLOAT float] [LBOUND lowerbound] [UBOUND upperbound] [SATURATE]"
 
 # Command with optional arg: LPOP key [count]
 "LPOP key " "[count]"
@@ -28,13 +28,12 @@
 "BITFIELD_RO k " "[GET encoding offset [GET encoding offset ...]]"
 "BITFIELD_RO k GE" "[GET encoding offset [GET encoding offset ...]]"
 "BITFIELD_RO k GET" "[GET encoding offset [GET encoding offset ...]]"
-# TODO: The following hints end with an unbalanced "]" which shouldn't be there.
-"BITFIELD_RO k GET " "encoding offset [GET encoding offset ...]]"
-"BITFIELD_RO k GET xyz " "offset [GET encoding offset ...]]"
-"BITFIELD_RO k GET xyz 12 " "[GET encoding offset ...]]"
-"BITFIELD_RO k GET xyz 12 GET " "encoding offset [GET encoding offset ...]]"
-"BITFIELD_RO k GET enc1 12 GET enc2 " "offset [GET encoding offset ...]]"
-"BITFIELD_RO k GET enc1 12 GET enc2 34 " "[GET encoding offset ...]]"
+"BITFIELD_RO k GET " "encoding offset [GET encoding offset ...]"
+"BITFIELD_RO k GET xyz " "offset [GET encoding offset ...]"
+"BITFIELD_RO k GET xyz 12 " "[GET encoding offset ...]"
+"BITFIELD_RO k GET xyz 12 GET " "encoding offset [GET encoding offset ...]"
+"BITFIELD_RO k GET enc1 12 GET enc2 " "offset [GET encoding offset ...]"
+"BITFIELD_RO k GET enc1 12 GET enc2 34 " "[GET encoding offset ...]"
 
 # Two-word command with multiple non-token block args:  CONFIG SET parameter value [parameter value ...]
 "CONFIG SET param " "value [parameter value ...]"
@@ -60,6 +59,9 @@
 
 # One-of choices: BLMOVE source destination LEFT|RIGHT LEFT|RIGHT timeout
 "BLMOVE src dst LEFT " "LEFT|RIGHT timeout"
+
+# Mutually exclusive arguments: RESTORE key ttl serialized-value [REPLACE] [ABSTTL] [IDLETIME seconds|FREQ frequency]
+"RESTORE key 0 serialized-value " "[REPLACE] [ABSTTL] [IDLETIME seconds|FREQ frequency]"
 
 # Optional args can be in any order: ZRANGE key min max [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES] [XX]
 "ZRANGE k 1 2 " "[BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES] [XX]"

@@ -101,6 +101,12 @@ start_server {tags {"scripting"}} {
         r get x
     } {}
 
+    test {EVAL - Return or raise error table with a metatable that raises error} {
+        catch {run_script {return setmetatable({err='x'}, {__index=function() error('boom') end})} 0}
+        catch {run_script {error(setmetatable({}, {__index=function() error('boom') end}))} 0}
+        r ping
+    } {PONG}
+
     test {EVAL - Lua integer -> Redis protocol type conversion} {
         run_script {return 100.5} 0
     } {100}
@@ -1052,6 +1058,12 @@ start_server {tags {"scripting"}} {
         r del scriptkey:wt
     }
 
+    test {server.log() keeps a multi-line message in one log record} {
+        set loglines [count_log_lines 0]
+        run_script {redis.log(redis.LOG_WARNING, 'before\r\nafter')} 0
+        verify_log_message 0 "*<lua> before  after*" $loglines
+    } {} {external:skip}
+
     test {Correct handling of reused argv (issue #1939)} {
         run_script {
               for i = 0, 10 do
@@ -1338,7 +1350,7 @@ start_server {tags {"scripting external:skip large-memory"}} {
 # Start a new server since the last test in this stanza will kill the
 # instance at all.
 start_server {tags {"scripting"}} {
-    test {Timedout read-only scripts can be killed by SCRIPT KILL} {
+    test {Timed out read-only scripts can be killed by SCRIPT KILL} {
         set rd [valkey_deferring_client]
         r config set lua-time-limit 10
         run_script_on_connection $rd {while true do end} 0
@@ -1351,7 +1363,7 @@ start_server {tags {"scripting"}} {
         $rd close
     }
 
-    test {Timedout read-only scripts can be killed by SCRIPT KILL even when use pcall} {
+    test {Timed out read-only scripts can be killed by SCRIPT KILL even when use pcall} {
         set rd [valkey_deferring_client]
         r config set lua-time-limit 10
         run_script_on_connection $rd {local f = function() while 1 do redis.call('ping') end end while 1 do pcall(f) end} 0
@@ -1379,7 +1391,7 @@ start_server {tags {"scripting"}} {
         assert_match {*killed by user*} $res
     }
 
-    test {Timedout script does not cause a false dead client} {
+    test {Timed out script does not cause a false dead client} {
         set rd [valkey_deferring_client]
         r config set lua-time-limit 10
 
@@ -1427,13 +1439,13 @@ start_server {tags {"scripting"}} {
         $rd close
     }
 
-    test {Timedout script link is still usable after Lua returns} {
+    test {Timed out script link is still usable after Lua returns} {
         r config set lua-time-limit 10
         run_script {for i=1,100000 do redis.call('ping') end return 'ok'} 0
         r ping
     } {PONG}
 
-    test {Timedout scripts and unblocked command} {
+    test {Timed out scripts and unblocked command} {
         # make sure a command that's allowed during BUSY doesn't trigger an unblocked command
 
         # enable AOF to also expose an assertion if the bug would happen
@@ -1481,7 +1493,7 @@ start_server {tags {"scripting"}} {
         r DEBUG set-disable-deny-scripts 0
     } {OK} {external:skip needs:debug}
 
-    test {Timedout scripts that modified data can't be killed by SCRIPT KILL} {
+    test {Timed out scripts that modified data can't be killed by SCRIPT KILL} {
         set rd [valkey_deferring_client]
         r config set lua-time-limit 10
         run_script_on_connection $rd {redis.call('set',KEYS[1],'y'); while true do end} 1 x
@@ -1496,7 +1508,7 @@ start_server {tags {"scripting"}} {
 
     # Note: keep this test at the end of this server stanza because it
     # kills the server.
-    test {SHUTDOWN NOSAVE can kill a timedout script anyway} {
+    test {SHUTDOWN NOSAVE can kill a timed out script anyway} {
         # The server should be still unresponding to normal commands.
         catch {r ping} e
         assert_match {BUSY*} $e
@@ -1724,6 +1736,26 @@ start_server {tags {"scripting external:skip"}} {
     }
 }
 
+start_server {tags {"scripting external:skip tls:skip"}} {
+    test {Forked scripting debug session does not suspend save points} {
+        set rd [valkey_deferring_client]
+        $rd script debug yes
+        assert_equal OK [$rd read]
+        $rd eval {return 'hello'} 0
+        assert_match {*Stopped at*} [$rd read]
+
+        r config set save "1 1"
+        r set foo bar
+        wait_for_condition 50 100 {
+            [s rdb_changes_since_last_save] == 0
+        } else {
+            fail "Save point did not fire while a forked debug session was open"
+        }
+        $rd close
+        r config set save ""
+    }
+}
+
 start_server {tags {"scripting needs:debug external:skip"}} {
     test {Test scripting debug protocol parsing} {
         r script debug sync
@@ -1795,6 +1827,18 @@ start_server {tags {"scripting needs:debug external:skip"}} {
         r flush
         assert_match {*<value>*somearg*} [r read]
         reconnect
+    }
+
+    test {Test scripting debug command larger than one read} {
+        r script debug sync
+        r eval {return 'hello'} 0
+        # The debugger reads 1024 bytes at a time, so this command arrives in two reads.
+        set arg [string repeat x 1020]
+        r write "*2\r\n\$5\r\nprint\r\n\$1020\r\n$arg\r\n"
+        r flush
+        r read
+        reconnect
+        assert_equal [r ping] {PONG}
     }
 }
 
